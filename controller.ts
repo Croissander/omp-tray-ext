@@ -28,23 +28,47 @@ function messageRole(message: unknown): string | undefined {
 export class TrayController {
   private current: DaemonState = "idle";
   private errorClearTimer: TimerHandle | null = null;
+  // ponytail: serializes state changes so the daemon sees them in the same
+  // order the extension emits them. Each sendState opens its own DBus
+  // connection (ipc.connectBus) with no cross-connection FIFO, so two
+  // concurrent transitions can reorder — a stale "working" landing after a
+  // later "idle" leaves the tray spinning forever. The chain forces call B
+  // to wait for call A's sendState to resolve before starting.
+  private chain: Promise<void> = Promise.resolve();
 
-  constructor(private pi: ExtensionAPI) {}
+  constructor(
+    private pi: ExtensionAPI,
+    /** @internal injectable for tests; defaults to the DBus client. */
+    private send: (s: DaemonState) => Promise<void> = sendState,
+  ) {}
 
-  private async transition(state: DaemonState) {
-    if (this.errorClearTimer) {
-      clearTimeout(this.errorClearTimer);
-      this.errorClearTimer = null;
-    }
-    if (this.current === state) return;
-    this.current = state;
-    await sendState(state);
+  private transition(state: DaemonState): Promise<void> {
+    // Catch so a failing send (e.g. timeout) can't reject the chain and wedge
+    // every later state — that would reproduce the stuck-spinning bug.
+    this.chain = this.chain
+      .then(async () => {
+        if (this.errorClearTimer) {
+          clearTimeout(this.errorClearTimer);
+          this.errorClearTimer = null;
+        }
+        if (this.current === state) return;
+        this.current = state;
+        await this.send(state);
+      })
+      .catch(() => {});
+    return this.chain;
   }
 
   // Error is transient: show "!!" briefly, then revert to idle/working.
   private flashError() {
-    void sendState("error");
-    this.current = "error";
+    // Routed through the chain too, so an un-awaited "error" send can't
+    // overtake a subsequent "idle"/"working" and wedge the daemon.
+    this.chain = this.chain
+      .then(async () => {
+        this.current = "error";
+        await this.send("error");
+      })
+      .catch(() => {});
     if (this.errorClearTimer) clearTimeout(this.errorClearTimer);
     this.errorClearTimer = setTimeout(() => {
       this.errorClearTimer = null;
