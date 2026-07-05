@@ -196,10 +196,13 @@ Conventions:
   truth. Both must move together: bump the field, then tag the same commit.
 - Semver-leaning: `1.0.1 → 1.0.2` for fixes/patches, → `1.1.0` for new
   commands/states, → `2.0.0` for a DBus contract break.
-- Tags are required for `omp install` to detect updates: a `git@...git` spec
+- Tags are required for `omp install` to detect updates: a spec
   without a ref pins the resolved HEAD SHA into `bun.lock` on first install and
   is then treated as satisfied — `omp` won't re-resolve against upstream. A
   moving ref (`#master`) or a tag (`#v1.1.0`) gives omp/bun a reason to compare.
+- bun 1.3.x does NOT parse `#ref` in scp-style git URLs (`git@github.com:...git#tag`
+  fails with "no commit matching"). Use the `github:owner/repo#ref` shorthand,
+  which omp translates to `git+ssh://` and resolves the ref correctly.
 
 Workflow:
 
@@ -219,14 +222,15 @@ git push origin master --tags
 Install/update from a tag:
 
 ```bash
-# Users install a pinned version:
-omp install git@github.com:Croissander/omp-tray-ext.git#v1.1.0
+# Users install a pinned version (use the github: shorthand — git@...#tag is not
+# parsed by bun):
+omp install github:Croissander/omp-tray-ext#v1.1.0
 
-# Or the moving master ref (re-resolves more eagerly than a bare git@ spec):
-omp install git@github.com:Croissander/omp-tray-ext.git#master
+# Or the moving master ref (re-resolves more eagerly than a bare spec):
+omp install github:Croissander/omp-tray-ext#master
 
 # Force-reinstall to pick up a new tag/master HEAD after a stale lockfile:
-omp install --force git@github.com:Croissander/omp-tray-ext.git#master
+omp install --force github:Croissander/omp-tray-ext#v1.1.0
 ```
 
 If `omp install --force` still resolves to the old SHA (bun sometimes treats an
@@ -235,8 +239,9 @@ manually and reinstall:
 
 ```bash
 rm -rf ~/.omp/plugins/node_modules/omp-tray-ext
-# drop the "omp-tray-ext" line from ~/.omp/plugins/bun.lock and package.json
-omp install git@github.com:Croissander/omp-tray-ext.git#master
+# drop the "omp-tray-ext" line from ~/.omp/plugins/package.json and bun.lock,
+# then reinstall with the new spec:
+omp install github:Croissander/omp-tray-ext#v1.1.0
 ```
 
 ## Further reading
