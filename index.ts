@@ -64,18 +64,41 @@ export default function ompTray(pi: ExtensionAPI) {
     if (daemonReady) await sendState("idle");
   });
 
+  // `/debug` is a omp builtin, so debug lives as `/tray debug` to avoid the
+  // reserved-name collision (the extension runner silently skips conflicts).
+  const SUBCOMMANDS = [
+    { name: "status", description: "Show daemon running state (default)" },
+    { name: "stop", description: "Stop the tray daemon" },
+    { name: "off", description: "Alias for stop" },
+    { name: "restart", description: "Stop and restart the daemon" },
+    { name: "working", description: "Force the tray to working" },
+    { name: "error", description: "Force the tray to error" },
+    { name: "debug", description: "Show plugin/daemon state for troubleshooting" },
+  ] as const;
+
   pi.registerCommand("tray", {
     description: "Control the persistent omp tray daemon",
+    getArgumentCompletions: (argumentPrefix) => {
+      if (argumentPrefix.includes(" ")) return null;
+      const lower = argumentPrefix.toLowerCase();
+      const matches = SUBCOMMANDS.filter((s) => s.name.startsWith(lower));
+      return matches.length > 0
+        ? matches.map((s) => ({ value: `${s.name} `, label: s.name, description: s.description }))
+        : null;
+    },
     handler: async (args, ctx) => {
       const arg = args.trim().toLowerCase();
       if (arg === "stop" || arg === "off") {
         await stopDaemon();
+        daemonReady = false;
         ctx.ui.notify("Tray daemon stopped", "info");
         return;
       }
       if (arg === "restart") {
         await stopDaemon();
-        await new Promise((r) => setTimeout(r, 300));
+        const { promise: delay, resolve } = Promise.withResolvers<void>();
+        setTimeout(resolve, 300);
+        await delay;
         daemonReady = await ensureDaemon();
         await sendState("idle");
         ctx.ui.notify(daemonReady ? "Tray daemon restarted" : "Tray restart failed", daemonReady ? "info" : "error");
@@ -84,6 +107,21 @@ export default function ompTray(pi: ExtensionAPI) {
       if (arg === "working" || arg === "error") {
         await sendState(arg);
         ctx.ui.notify(`Tray state: ${arg}`, "info");
+        return;
+      }
+      if (arg === "debug") {
+        const daemonRunning = await daemonAlive();
+        const lines = [
+          `daemon running : ${daemonRunning}`,
+          `daemon ready  : ${daemonReady}`,
+          `daemon pid    : ${daemonPid ?? "(none)"}`,
+          `plugin state  : ${controller.state}`,
+          `daemon script : ${DAEMON_SCRIPT}`,
+          `model         : ${ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "(none)"}`,
+          `agent idle    : ${ctx.isIdle()}`,
+          `cwd           : ${ctx.cwd}`,
+        ];
+        ctx.ui.notify(lines.join("\n"), "info");
         return;
       }
       const alive = await daemonAlive();

@@ -1,6 +1,6 @@
 {
   "name": "omp-tray-ext",
-  "version": "1.0.1",
+  "version": "1.1.0",
   "description": "A native Linux status-bar tray for Oh My Pi (omp) that reflects agent state (idle/working/errored/compacting). Implements the StatusNotifierItem (SNI) spec over DBus.",
   "module": "index.ts",
   "type": "module",

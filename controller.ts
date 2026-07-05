@@ -42,6 +42,11 @@ export class TrayController {
     private send: (s: DaemonState) => Promise<void> = sendState,
   ) {}
 
+  /** Current plugin-side state (last value forwarded toward the daemon). */
+  get state(): DaemonState {
+    return this.current;
+  }
+
   private transition(state: DaemonState): Promise<void> {
     // Catch so a failing send (e.g. timeout) can't reject the chain and wedge
     // every later state — that would reproduce the stuck-spinning bug.
