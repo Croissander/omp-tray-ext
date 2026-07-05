@@ -89,6 +89,16 @@ extensions:
 omp --extension ./omp-tray-ext
 ```
 
+**Option D — install via the `omp` CLI (pinned to a release tag):**
+
+```bash
+omp install git@github.com:Croissander/omp-tray-ext.git#v1.1.0
+```
+
+Always install with a `#vX.Y.Z` tag (or `#master`) — a bare `git@...` spec gets
+pinned to whatever HEAD `bun` first resolved and `omp` won't detect updates.
+To move to a newer release later: `omp install --force git@...git#vX.Y.Z`.
+
 **Updating:** `git pull` in the cloned directory. No rebuild needed — omp
 imports the TypeScript directly via Bun.
 
