@@ -184,17 +184,22 @@ imported at startup, not hot-reloaded. `daemonReady` is re-checked on
 
 ## Release / version policy  ⚠️
 
-**After every bigger change, bump the version in `package.json` and push to
-GitHub.** "Bigger" = any user-visible behavior change, new command, new state,
+**After every bigger change, bump the version in `package.json`, tag, and push
+to GitHub.** "Bigger" = any user-visible behavior change, new command, new state,
 DBus contract change, or anything touching `daemon.ts`/`ipc.ts`/`controller.ts`
 invariants. Pure refactor of identical behavior with no observable change does
 not require a bump.
 
 Conventions:
 
-- `package.json#version` is the single source of truth (no git tags today).
+- `package.json#version` and the matching git tag `vX.Y.Z` are the source of
+  truth. Both must move together: bump the field, then tag the same commit.
 - Semver-leaning: `1.0.1 → 1.0.2` for fixes/patches, → `1.1.0` for new
   commands/states, → `2.0.0` for a DBus contract break.
+- Tags are required for `omp install` to detect updates: a `git@...git` spec
+  without a ref pins the resolved HEAD SHA into `bun.lock` on first install and
+  is then treated as satisfied — `omp` won't re-resolve against upstream. A
+  moving ref (`#master`) or a tag (`#v1.1.0`) gives omp/bun a reason to compare.
 
 Workflow:
 
@@ -204,13 +209,35 @@ bunx tsc --noEmit && bun test controller.test.ts
 
 # 2. Bump version in package.json (edit version: "x.y.z").
 
-# 3. Commit + push.
+# 3. Commit, tag, push.
 git add -A
 git commit -m "<scope>: <what changed> (vX.Y.Z)"
-git push origin master
+git tag vX.Y.Z
+git push origin master --tags
 ```
 
-Remote: `git@github.com:Croissander/omp-tray-ext.git`, branch `master`.
+Install/update from a tag:
+
+```bash
+# Users install a pinned version:
+omp install git@github.com:Croissander/omp-tray-ext.git#v1.1.0
+
+# Or the moving master ref (re-resolves more eagerly than a bare git@ spec):
+omp install git@github.com:Croissander/omp-tray-ext.git#master
+
+# Force-reinstall to pick up a new tag/master HEAD after a stale lockfile:
+omp install --force git@github.com:Croissander/omp-tray-ext.git#master
+```
+
+If `omp install --force` still resolves to the old SHA (bun sometimes treats an
+existing satisfied lockfile entry as enough), remove the stale resolution
+manually and reinstall:
+
+```bash
+rm -rf ~/.omp/plugins/node_modules/omp-tray-ext
+# drop the "omp-tray-ext" line from ~/.omp/plugins/bun.lock and package.json
+omp install git@github.com:Croissander/omp-tray-ext.git#master
+```
 
 ## Further reading
 
