@@ -6,30 +6,43 @@
 // to the daemon over DBus IPC. The tray shows:
 //   idle    ">_"   (prompt glyph)
 //   working  spinning ring (a rotated circle with a chunk missing)
+import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 import { TrayController } from "./controller";
-import { daemonAlive, sendState, stopDaemon } from "./ipc";
+import { daemonAlive, stopDaemon } from "./ipc";
 
 
-const DAEMON_SCRIPT = new URL("./daemon.ts", import.meta.url).pathname;
+const DAEMON_SCRIPT = fileURLToPath(new URL("./daemon.ts", import.meta.url));
 /** Fork the daemon detached so it outlives this omp process. */
 let daemonPid: number | null = null;
+
+function sleep(ms: number): Promise<void> {
+  const { promise, resolve } = Promise.withResolvers<void>();
+  setTimeout(resolve, ms);
+  return promise;
+}
 
 async function ensureDaemon(): Promise<boolean> {
   if (await daemonAlive()) return true;
   try {
-    const proc = Bun.spawn(["bun", "run", DAEMON_SCRIPT], {
+    // process.execPath is the bun binary itself (omp loads extensions via
+    // Bun), so we don't depend on `bun` being on the spawned process's PATH.
+    const proc = Bun.spawn([process.execPath, "run", DAEMON_SCRIPT], {
       stdio: ["ignore", "ignore", "ignore"],
       detached: true,
     });
     proc.unref();
     daemonPid = proc.pid;
-    // Give the daemon a moment to claim its DBus name before we send state.
-    await new Promise((r) => setTimeout(r, 600));
   } catch {
     return false;
   }
-  return daemonAlive();
+  // Poll until the daemon claims its DBus name — fast when Bun boots quickly,
+  // resilient when startup is slow (a fixed sleep is neither).
+  for (let waited = 0; waited < 2000; waited += 100) {
+    if (await daemonAlive()) return true;
+    await sleep(100);
+  }
+  return false;
 }
 
 // ponytail: last-resort synchronous kill on ANY exit path. session_shutdown
@@ -59,12 +72,14 @@ export default function ompTray(pi: ExtensionAPI) {
   });
 
   // Re-ensure after reload/session-switch (daemon may have been stopped).
+  // Reseed goes through the controller chain, never a bare sendState — a
+  // direct send here could reorder against a transition queued in between.
   pi.on("session_start", async () => {
     daemonReady = await ensureDaemon();
-    if (daemonReady) await sendState("idle");
+    if (daemonReady) await controller.reseed();
   });
 
-  // `/debug` is a omp builtin, so debug lives as `/tray debug` to avoid the
+  // `/debug` is an omp builtin, so debug lives as `/tray debug` to avoid the
   // reserved-name collision (the extension runner silently skips conflicts).
   const SUBCOMMANDS = [
     { name: "status", description: "Show daemon running state (default)" },
@@ -96,16 +111,14 @@ export default function ompTray(pi: ExtensionAPI) {
       }
       if (arg === "restart") {
         await stopDaemon();
-        const { promise: delay, resolve } = Promise.withResolvers<void>();
-        setTimeout(resolve, 300);
-        await delay;
+        await sleep(300);
         daemonReady = await ensureDaemon();
-        await sendState("idle");
+        if (daemonReady) await controller.reseed();
         ctx.ui.notify(daemonReady ? "Tray daemon restarted" : "Tray restart failed", daemonReady ? "info" : "error");
         return;
       }
       if (arg === "working" || arg === "error") {
-        await sendState(arg);
+        await controller.force(arg);
         ctx.ui.notify(`Tray state: ${arg}`, "info");
         return;
       }

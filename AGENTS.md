@@ -32,7 +32,7 @@ omp process (transient)          tray daemon (tied to omp lifetime)
   connection FIFO — the controller serializes state changes itself (see below).
 - `controller.ts` — maps omp lifecycle events to `idle`/`working`/`error`
   states and forwards them. Exposes `.state` for the `/tray debug` command.
-- `icons.ts` — monochrome glyphs: `>` chevron + `_`, `!!`, 8 spinner frames.
+- `icons.ts` — monochrome glyphs: `>` chevron + `_`, `X` (crossed strokes), 8 spinner frames.
 
 ### State mapping
 
@@ -40,7 +40,7 @@ omp process (transient)          tray daemon (tied to omp lifetime)
 |-------------|-----------|--------------|----------|
 | idle | `>_` prompt glyph | `Passive`→`Active` | `session_start` / `agent_end` |
 | working | spinning ring (~8 fps) | `Active` | `agent_start` / `before_provider_request` / `tool_execution_start` |
-| error | `!!` double exclamation | `NeedsAttention` | `tool_result` with `isError` (auto-clears after 5 s) |
+| error | `X` crossed strokes | `NeedsAttention` | `tool_result` with `isError` (auto-clears after 5 s) |
 
 ### Key invariants (do not break)
 
@@ -55,7 +55,7 @@ omp process (transient)          tray daemon (tied to omp lifetime)
   signal-based exit paths (SIGHUP/SIGTERM) that skip `session.dispose()`. The
   daemon's own SIGTERM handler removes the SNI item cleanly. `process.kill` on an
   already-dead PID throws ESRCH — swallowed.
-- **Error is transient.** `flashError()` shows `!!` for 5 s, then reverts. It is
+- **Error is transient.** `flashError()` shows `X` for 5 s, then reverts. It is
   routed through the same chain so an un-awaited error send can't overtake a
   later idle/working.
 - **Tray IPC never blocks the agent loop.** `sendState` is a no-op if the daemon
@@ -120,11 +120,12 @@ editor → dropdown). `/tray debug` reports: daemon running/ready/PID, plugin-si
   Bun). Required by users at runtime too.
 - Target: a Linux desktop with a DBus session bus and an SNA host (KDE Plasma,
   GNOME + Appindicator, waybar tray module, swaync/swaybar, …).
-- TypeScript is a `peerDependency`; `@types/bun` is the only dev type source.
-  `@oh-my-pi/pi-coding-agent` is **not** installed locally — it's an ambient
-  host-provided type. To resolve types during editing, it must be available on
-  the host (it ships with omp at `~/.omp/plugins/node_modules/...` and in the
-  bun cache). Do not add it to `dependencies`; do not import it at runtime.
+- TypeScript is a `peerDependency`; `@types/bun` is a dev type source.
+  `@oh-my-pi/pi-coding-agent` is a **devDependency used for types only** —
+  every import is `import type`, erased at runtime by Bun. omp binaries are
+  compiled ELF and don't expose `.d.ts` on the host, so the types come from
+  npm (`bun add -d @oh-my-pi/pi-coding-agent`). Never move it to
+  `dependencies` and never import it at runtime.
 
 ### Local dev loop
 

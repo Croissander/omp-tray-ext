@@ -47,7 +47,7 @@ export class TrayController {
     return this.current;
   }
 
-  private transition(state: DaemonState): Promise<void> {
+  private transition(state: DaemonState, force = false): Promise<void> {
     // Catch so a failing send (e.g. timeout) can't reject the chain and wedge
     // every later state — that would reproduce the stuck-spinning bug.
     this.chain = this.chain
@@ -56,7 +56,7 @@ export class TrayController {
           clearTimeout(this.errorClearTimer);
           this.errorClearTimer = null;
         }
-        if (this.current === state) return;
+        if (!force && this.current === state) return;
         this.current = state;
         await this.send(state);
       })
@@ -64,12 +64,27 @@ export class TrayController {
     return this.chain;
   }
 
+  /** External override (/tray working|error): always sends so the daemon and
+   *  the plugin-side state stay in sync. */
+  force(state: DaemonState): Promise<void> {
+    return this.transition(state, true);
+  }
+
+  /** Re-send the current state through the chain — after the daemon was
+   *  (re)spawned, so the fresh daemon learns where we are. */
+  reseed(): Promise<void> {
+    return this.transition(this.current, true);
+  }
+
   // Error is transient: show "!!" briefly, then revert to idle/working.
   private flashError() {
     // Routed through the chain too, so an un-awaited "error" send can't
-    // overtake a subsequent "idle"/"working" and wedge the daemon.
+    // overtake a subsequent "idle"/"working" and wedge the daemon. Skipped
+    // when already flashing (two tool errors in a row) — the timer reset
+    // below still extends the 5 s window.
     this.chain = this.chain
       .then(async () => {
+        if (this.current === "error") return;
         this.current = "error";
         await this.send("error");
       })

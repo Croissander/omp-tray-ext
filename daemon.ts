@@ -2,16 +2,15 @@
 // (index.ts) spawns this detached at load and stops it on quit via DBus
 // method calls on org.omptray.Daemon.
 //
-// States:  idle=">_",  working=spinning ring,  error="!!"
+// States:  idle=">_",  working=spinning ring,  error="X"
 // The daemon's lifetime mirrors the omp process: spawned at startup,
 // removed on exit.
 
 import dbus from "dbus-next";
+import { DAEMON_IFACE, DAEMON_NAME, DAEMON_PATH, type DaemonState } from "./ipc";
 import { glyph, spinnerFrameByIndex, toArgb, type Pixels } from "./icons";
 
 const { interface: iface } = dbus;
-
-type DaemonState = "idle" | "working" | "error";
 
 interface WatcherIface {
   RegisterStatusNotifierItem(service: string): Promise<void>;
@@ -25,9 +24,6 @@ function busName(bus: dbus.MessageBus): string {
   return (bus as BusWithName).name ?? "";
 }
 
-const DAEMON_IFACE = "org.omptray.Daemon";
-const DAEMON_PATH = "/org/omptray/Daemon";
-const DAEMON_NAME = "org.omptray.Daemon";
 const SNI_IFACE = "org.kde.StatusNotifierItem";
 const SNI_PATH = "/StatusNotifierItem";
 const SNI_NAME = "org.kde.StatusNotifierItem.omptray";
@@ -95,13 +91,19 @@ OmpTrayItem.configureMembers({
 
 
 
-//麒 ponytail: the daemon's own control interface accepts SetState(s) + Stop().
+// ponytail: the daemon's own control interface accepts SetState(s) + Stop().
 class DaemonControl extends iface.Interface {
   constructor() {
     super(DAEMON_IFACE);
   }
   SetState(state: string) {
-    daemon.setState(state as DaemonState);
+    // DBus method args are a trust boundary — don't let garbage state strings
+    // put the daemon into an unhandled state.
+    if (state !== "idle" && state !== "working" && state !== "error") {
+      console.warn(`[omptray-daemon] ignoring invalid SetState: ${String(state)}`);
+      return;
+    }
+    daemon.setState(state);
   }
   Stop() {
     // Defer shutdown so the DBus reply for Stop() is delivered before exit.
@@ -214,7 +216,18 @@ class Daemon {
     const { promise, resolve } = Promise.withResolvers<boolean>();
     const t = setTimeout(() => resolve(false), 10000);
     bus.on("connect", () => { clearTimeout(t); resolve(true); });
-    bus.on("error", () => { clearTimeout(t); resolve(false); });
+    bus.on("error", (e) => {
+      clearTimeout(t);
+      resolve(false); // no-op once the start promise has settled
+      if (this.started) {
+        // Bus died mid-flight. Without DBus we're nothing; the names vanish
+        // with the socket so the panel drops the icon, and the extension
+        // respawns us on the next session_start. Without this, a "working"
+        // spinner interval keeps the process alive forever as a zombie.
+        console.error("[omptray-daemon] session bus error:", (e as Error).message);
+        this.shutdown();
+      }
+    });
     const connected = await promise;
     if (!connected) {
       console.error("[omptray-daemon] session bus connect failed or timed out");
@@ -264,7 +277,8 @@ class Daemon {
       bus.releaseName(SNI_NAME).catch(() => {});
       bus.releaseName(DAEMON_NAME).catch(() => {});
     } finally {
-      bus.disconnect();
+      // Disconnecting an already-dead bus throws — swallow (AGENTS.md rule).
+      try { bus.disconnect(); } catch {}
       this.bus = null;
       this.item = null;
       this.control = null;
@@ -278,12 +292,9 @@ class Daemon {
 const daemon = new Daemon();
 
 // Graceful signals: release the name so the panel removes the icon promptly.
-const die = (sig: string) => {
-  process.removeListener(sig, (die as unknown as () => void));
-  daemon.shutdown();
-};
+const die = () => daemon.shutdown();
 for (const sig of ["SIGTERM", "SIGINT", "SIGHUP"] as const) {
-  process.on(sig, () => die(sig));
+  process.on(sig, die);
 }
 
 if (import.meta.main) {

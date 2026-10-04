@@ -12,15 +12,13 @@ function blank(): Pixels {
 }
 
 /** Set a pixel to opaque white. */
-function set(px: Pixels, x: number, y: number, on = true) {
+function set(px: Pixels, x: number, y: number) {
   if (x < 0 || y < 0 || x >= SIZE || y >= SIZE) return;
   const idx = (y * SIZE + x) * 4;
-  if (on) {
-    px.rgba[idx] = 255;
-    px.rgba[idx + 1] = 255;
-    px.rgba[idx + 2] = 255;
-    px.rgba[idx + 3] = 255;
-  }
+  px.rgba[idx] = 255;
+  px.rgba[idx + 1] = 255;
+  px.rgba[idx + 2] = 255;
+  px.rgba[idx + 3] = 255;
 }
 
 /** ">_" idle prompt glyph: a ">" chevron + baseline underscore. */
@@ -85,12 +83,10 @@ function spinnerFrame(rotation: number): Pixels {
 /** All 8 spinner frames, pre-rendered. */
 const spinnerFrames: Pixels[] = Array.from({ length: 8 }, (_, i) => spinnerFrame(i));
 
-export type IconKind = "prompt" | "error" | "spinner";
+export type IconKind = "prompt" | "error";
 
 export function glyph(kind: IconKind): Pixels {
-  if (kind === "prompt") return promptGlyph();
-  if (kind === "error") return errorGlyph();
-  return spinnerFrames[0] ?? promptGlyph();
+  return kind === "prompt" ? promptGlyph() : errorGlyph();
 }
 
 export function spinnerFrameByIndex(i: number): Pixels {
@@ -99,8 +95,8 @@ export function spinnerFrameByIndex(i: number): Pixels {
 
 /** Convert a Pixels buffer to ARGB32 (a,r,g,b) bytes for SNI IconPixmap. */
 export function toArgb(px: Pixels): { w: number; h: number; bytes: Uint8Array } {
-  const bytes = new Uint8Array(SIZE * SIZE * 4);
-  for (let i = 0; i < SIZE * SIZE; i++) {
+  const bytes = new Uint8Array(px.w * px.h * 4);
+  for (let i = 0; i < px.w * px.h; i++) {
     const r = px.rgba[i * 4] ?? 0;
     const g = px.rgba[i * 4 + 1] ?? 0;
     const b = px.rgba[i * 4 + 2] ?? 0;
@@ -110,11 +106,8 @@ export function toArgb(px: Pixels): { w: number; h: number; bytes: Uint8Array } 
     bytes[i * 4 + 2] = g;
     bytes[i * 4 + 3] = b;
   }
-  return { w: SIZE, h: SIZE, bytes };
+  return { w: px.w, h: px.h, bytes };
 }
-
-/** Size constant, re-exported for consistency. */
-export const ICON_SIZE = SIZE;
 
 if (import.meta.main) {
   const glyphs: Record<string, Pixels> = {

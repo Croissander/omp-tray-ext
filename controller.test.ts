@@ -70,3 +70,52 @@ test("flashError routes through the chain and cannot overtake a later idle", asy
   await drain();
   expect(observed).toEqual(["error", "idle"]);
 });
+
+test("force always sends, bypassing the transition dedupe", async () => {
+  const observed: DaemonState[] = [];
+  const send = async (s: DaemonState): Promise<void> => {
+    observed.push(s);
+  };
+
+  const c = new TrayController(stubApi(), send);
+  void c["transition"]("working");
+  await drain();
+  expect(observed).toEqual(["working"]);
+  // Same state: transition dedupes, force (/tray working) must still send so
+  // the plugin-side state and the daemon stay in sync.
+  void c["transition"]("working");
+  void c.force("working");
+  await drain();
+  expect(observed).toEqual(["working", "working"]);
+});
+
+test("reseed resends the current state after a daemon respawn", async () => {
+  const observed: DaemonState[] = [];
+  const send = async (s: DaemonState): Promise<void> => {
+    observed.push(s);
+  };
+
+  const c = new TrayController(stubApi(), send);
+  void c["transition"]("working");
+  await drain();
+  expect(observed).toEqual(["working"]);
+  // Fresh daemon knows nothing — reseed must replay the current state.
+  void c.reseed();
+  await drain();
+  expect(observed).toEqual(["working", "working"]);
+});
+
+test("flashError does not resend while already flashing", async () => {
+  const observed: DaemonState[] = [];
+  const send = async (s: DaemonState): Promise<void> => {
+    observed.push(s);
+  };
+
+  const c = new TrayController(stubApi(), send);
+  void c["flashError"]();
+  void c["flashError"]();
+  await drain();
+  // One send for two consecutive tool errors — the second only extends the
+  // 5 s auto-clear timer.
+  expect(observed).toEqual(["error"]);
+});

@@ -21,12 +21,27 @@ and pushed as `IconPixmap` ARGB data over DBus.
 
 | Agent state | Tray icon | SNI `Status` | Fires on |
 |-------------|-----------|--------------|----------|
-| idle | `>_` prompt glyph | `Passive` | `session_start` / `agent_end` / `turn_end` |
+| idle | `>_` prompt glyph | `Active` | `session_start` / `agent_end` |
 | working | spinning ring (rotated circle, chunk missing; monochrome) | `Active` | `agent_start` / `before_provider_request` / `tool_execution_start` |
-| error | `!!` double exclamation | `NeedsAttention` | `tool_result` with `isError` (auto-clears after 5 s) |
+| error | `X` crossed strokes | `NeedsAttention` | `tool_result` with `isError` (auto-clears after 5 s) |
 
 The spinner animates at ~8 fps while the agent is working — each frame is a
 ring with a ~90° arc gap, rotated 45° per frame.
+
+## Usage
+
+The extension registers a `/tray` slash command inside omp:
+
+```
+/tray                show daemon running state (default)
+/tray stop | off     stop the daemon (tray icon disappears)
+/tray restart        stop + re-spawn the daemon
+/tray working        force the tray to the working spinner
+/tray error          force the tray to the error glyph
+/tray debug          show plugin/daemon state for troubleshooting
+```
+
+Subcommands autocomplete as you type them.
 
 ## Architecture
 
@@ -52,7 +67,7 @@ omp process (transient)          tray daemon (tied to omp lifetime)
   renders the spinner and responds to `SetState`/`Stop`.
 - `ipc.ts` — shared DBus client: `daemonAlive`, `sendState`, `stopDaemon`.
 - `controller.ts` — maps omp lifecycle events to `idle`/`working`/`error`.
-- `icons.ts` — monochrome glyphs: `>` chevron + `_`, `!!`, 8 spinner frames.
+- `icons.ts` — monochrome glyphs: `>` chevron + `_`, `X` (crossed strokes), 8 spinner frames.
 
 ## Install
 
@@ -109,3 +124,12 @@ imports the TypeScript directly via Bun.
 - Linux desktop with a DBus session bus and an SNA host running in your panel.
 - `dbus-next` (installed by `bun install`; pure JS, no native build).
 - `bun` (the extension and daemon import TS directly; omp loads via Bun).
+
+## Limitations
+
+- **One tray per session bus.** The daemon claims a fixed DBus name with
+  `REPLACE_EXISTING`, so launching a second omp instance steals the tray icon
+  from the first; both instances' states then interleave on a single icon.
+- **Daemon recovery waits for `session_start`.** If the daemon dies mid-turn,
+  the tray stays gone until the next session start (or `/tray restart`);
+  state events sent in between are dropped silently.

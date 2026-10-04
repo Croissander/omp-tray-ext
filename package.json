@@ -1,7 +1,7 @@
 {
   "name": "omp-tray-ext",
-  "version": "1.1.0",
-  "description": "A native Linux status-bar tray for Oh My Pi (omp) that reflects agent state (idle/working/errored/compacting). Implements the StatusNotifierItem (SNI) spec over DBus.",
+  "version": "1.1.1",
+  "description": "A native Linux status-bar tray for Oh My Pi (omp) that reflects agent state (idle/working/error). Implements the StatusNotifierItem (SNI) spec over DBus.",
   "module": "index.ts",
   "type": "module",
   "private": true,
@@ -15,7 +15,7 @@
     "url": "https://github.com/Croissander/omp-tray-ext/issues"
   },
   "license": "MIT",
-  "author": "Cursader <igorpodsiadlo@gmail.com>",
+  "author": "Croissander <igorpodsiadlo@gmail.com>",
   "keywords": [
     "oh-my-pi",
     "omp",
@@ -34,6 +34,7 @@
     "dbus-next": "^0.10.2"
   },
   "devDependencies": {
+    "@oh-my-pi/pi-coding-agent": "^18.6.1",
     "@types/bun": "latest"
   },
   "peerDependencies": {
