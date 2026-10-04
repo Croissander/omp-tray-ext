@@ -23,7 +23,7 @@ and pushed as `IconPixmap` ARGB data over DBus.
 |-------------|-----------|--------------|----------|
 | idle | `>_` prompt glyph | `Active` | `session_start` / `agent_end` |
 | working | spinning ring (rotated circle, chunk missing; monochrome) | `Active` | `agent_start` / `before_provider_request` / `tool_execution_start` |
-| error | `X` crossed strokes | `NeedsAttention` | `tool_result` with `isError` (auto-clears after 5 s) |
+| error | `X` crossed strokes | `NeedsAttention` | `tool_result` with `isError` (auto-clears after 5 s, reverting to the pre-error `working`/`idle` state) |
 
 The spinner animates at ~8 fps while the agent is working — each frame is a
 ring with a ~90° arc gap, rotated 45° per frame.
@@ -61,12 +61,14 @@ omp process (transient)          tray daemon (tied to omp lifetime)
                                  KDE / GNOME / waybar panel
 ```
 
-- `index.ts` — extension entry; spawns the daemon detached, forwards events,
+- `index.ts` — extension entry; owns `session_start` (`ensureDaemon()` then
+  `controller.force("idle")`), spawns the daemon detached, forwards turn events,
   registers the `/tray` command.
 - `daemon.ts` — owns the SNI item + `org.omptray.Daemon` control interface;
   renders the spinner and responds to `SetState`/`Stop`.
 - `ipc.ts` — shared DBus client: `daemonAlive`, `sendState`, `stopDaemon`.
-- `controller.ts` — maps omp lifecycle events to `idle`/`working`/`error`.
+- `controller.ts` — maps omp turn events to `idle`/`working`/`error`;
+  `attach()` maps turn events only — `session_start` is owned by `index.ts`.
 - `icons.ts` — monochrome glyphs: `>` chevron + `_`, `X` (crossed strokes), 8 spinner frames.
 
 ## Install
@@ -107,7 +109,7 @@ omp --extension ./omp-tray-ext
 **Option D — install via the `omp` CLI (pinned to a release tag):**
 
 ```bash
-omp install github:Croissander/omp-tray-ext#v1.1.0
+omp install github:Croissander/omp-tray-ext#v1.1.2
 ```
 
 Always install with a `#vX.Y.Z` tag (or `#master`) — a bare `git@...` spec gets

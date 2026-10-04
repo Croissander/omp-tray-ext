@@ -13,8 +13,8 @@ function blank(): Pixels {
 
 /** Set a pixel to opaque white. */
 function set(px: Pixels, x: number, y: number) {
-  if (x < 0 || y < 0 || x >= SIZE || y >= SIZE) return;
-  const idx = (y * SIZE + x) * 4;
+  if (x < 0 || y < 0 || x >= px.w || y >= px.h) return;
+  const idx = (y * px.w + x) * 4;
   px.rgba[idx] = 255;
   px.rgba[idx + 1] = 255;
   px.rgba[idx + 2] = 255;
@@ -85,12 +85,19 @@ const spinnerFrames: Pixels[] = Array.from({ length: 8 }, (_, i) => spinnerFrame
 
 export type IconKind = "prompt" | "error";
 
+// Glyphs are pre-rendered once, like the spinner frames. The instances
+// returned by `glyph` are shared — callers must not mutate them.
+const glyphCache: Record<IconKind, Pixels> = {
+  prompt: promptGlyph(),
+  error: errorGlyph(),
+};
+
 export function glyph(kind: IconKind): Pixels {
-  return kind === "prompt" ? promptGlyph() : errorGlyph();
+  return glyphCache[kind];
 }
 
 export function spinnerFrameByIndex(i: number): Pixels {
-  return spinnerFrames[i % 8] ?? spinnerFrames[0] ?? promptGlyph();
+  return spinnerFrames[i % 8] ?? spinnerFrames[0]!;
 }
 
 /** Convert a Pixels buffer to ARGB32 (a,r,g,b) bytes for SNI IconPixmap. */

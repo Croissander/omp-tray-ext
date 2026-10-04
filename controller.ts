@@ -18,15 +18,17 @@ function messageRole(message: unknown): string | undefined {
 }
 
 /**
- * Mapping (the daemon renders: idle=">_", working=spinner, error="!!"):
- *  - session_start / agent_end → idle (turn_end ignored; it fires mid-loop)
+ * Mapping (the daemon renders: idle=">_", working=spinner, error="X"):
+ *  - agent_end → idle (turn_end ignored; it fires mid-loop)
  *  - agent_start / tool_execution_start → working
  *  - before_provider_request / assistant message_start → working
- *  - tool_result(isError) → error (transient; cleared by the next turn event)
+ *  - tool_result(isError) → error (transient; reverts to the pre-error
+ *    state after errorMs)
  *  - (shutdown handled by index.ts: stops the daemon on quit)
  */
 export class TrayController {
   private current: DaemonState = "idle";
+  private revertTo: DaemonState = "idle";
   private errorClearTimer: TimerHandle | null = null;
   // ponytail: serializes state changes so the daemon sees them in the same
   // order the extension emits them. Each sendState opens its own DBus
@@ -40,6 +42,8 @@ export class TrayController {
     private pi: ExtensionAPI,
     /** @internal injectable for tests; defaults to the DBus client. */
     private send: (s: DaemonState) => Promise<void> = sendState,
+    /** @internal injectable for tests; error flash duration in ms. */
+    private errorMs = 5000,
   ) {}
 
   /** Current plugin-side state (last value forwarded toward the daemon). */
@@ -76,31 +80,30 @@ export class TrayController {
     return this.transition(this.current, true);
   }
 
-  // Error is transient: show "!!" briefly, then revert to idle/working.
+  // Error is transient: show "X" briefly (errorMs), then revert to the state
+  // that was current before the flash (working or idle).
   private flashError() {
     // Routed through the chain too, so an un-awaited "error" send can't
     // overtake a subsequent "idle"/"working" and wedge the daemon. Skipped
     // when already flashing (two tool errors in a row) — the timer reset
-    // below still extends the 5 s window.
+    // below still extends the errorMs window. The revert target is captured
+    // inside the job because `current` only updates when queued jobs run.
     this.chain = this.chain
       .then(async () => {
         if (this.current === "error") return;
+        this.revertTo = this.current;
         this.current = "error";
         await this.send("error");
       })
       .catch(() => {});
-    if (this.errorClearTimer) clearTimeout(this.errorClearTimer);
+    clearTimeout(this.errorClearTimer ?? undefined);
     this.errorClearTimer = setTimeout(() => {
       this.errorClearTimer = null;
-      void this.transition("idle");
-    }, 5000);
+      void this.transition(this.revertTo);
+    }, this.errorMs);
   }
 
   attach() {
-    this.pi.on("session_start", async () => {
-      await this.transition("idle");
-    });
-
     this.pi.on("agent_start", async () => {
       await this.transition("working");
     });

@@ -119,3 +119,27 @@ test("flashError does not resend while already flashing", async () => {
   // 5 s auto-clear timer.
   expect(observed).toEqual(["error"]);
 });
+
+test("flashError reverts to the pre-error state after errorMs", async () => {
+  const observed: DaemonState[] = [];
+  const send = async (s: DaemonState): Promise<void> => {
+    observed.push(s);
+  };
+
+  // 10 ms flash window, so the test only burns ~30 ms of real time.
+  const c = new TrayController(stubApi(), send, 10);
+  void c["transition"]("working");
+  await drain();
+  void c["flashError"]();
+  await drain();
+  // Real-clock wait, well past the 10 ms flash window. Deliberate: fake
+  // timers cannot drive this test — the flash timer must fire between chain
+  // drains while drain() itself schedules real macrotasks on the same clock.
+  const { promise: flashed, resolve: tick } = Promise.withResolvers<void>();
+  setTimeout(tick, 30);
+  await flashed;
+  await drain();
+  // Reverts to "working" (the pre-error state), NOT hardcoded idle.
+  expect(observed).toEqual(["working", "error", "working"]);
+  expect(c.state).toBe("working");
+});

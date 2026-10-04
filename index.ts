@@ -72,11 +72,12 @@ export default function ompTray(pi: ExtensionAPI) {
   });
 
   // Re-ensure after reload/session-switch (daemon may have been stopped).
-  // Reseed goes through the controller chain, never a bare sendState — a
-  // direct send here could reorder against a transition queued in between.
+  // force("idle") resets a stale "working" for a new session and force-sends
+  // through the controller chain so a fresh daemon learns where we are —
+  // never a bare sendState, which could reorder against a queued transition.
   pi.on("session_start", async () => {
     daemonReady = await ensureDaemon();
-    if (daemonReady) await controller.reseed();
+    if (daemonReady) await controller.force("idle");
   });
 
   // `/debug` is an omp builtin, so debug lives as `/tray debug` to avoid the
@@ -111,7 +112,12 @@ export default function ompTray(pi: ExtensionAPI) {
       }
       if (arg === "restart") {
         await stopDaemon();
-        await sleep(300);
+        // Wait until the old daemon is actually gone before respawning: if
+        // ensureDaemon() ran while daemonAlive() was still true, it would
+        // adopt the dying daemon and never spawn a fresh one. Bounded ~2 s.
+        for (let waited = 0; waited < 2000 && (await daemonAlive()); waited += 100) {
+          await sleep(100);
+        }
         daemonReady = await ensureDaemon();
         if (daemonReady) await controller.reseed();
         ctx.ui.notify(daemonReady ? "Tray daemon restarted" : "Tray restart failed", daemonReady ? "info" : "error");

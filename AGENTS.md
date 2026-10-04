@@ -22,16 +22,21 @@ omp process (transient)          tray daemon (tied to omp lifetime)
                        KDE / GNOME / waybar panel
 ```
 
-- `index.ts` — extension entry; spawns the daemon detached, forwards omp
-  lifecycle events to it, registers the `/tray` slash command.
+- `index.ts` — extension entry; owns `session_start`: `ensureDaemon()` then
+  `controller.force("idle")`. Spawns the daemon detached, forwards omp turn
+  events to it, registers the `/tray` slash command.
 - `daemon.ts` — owns the SNI item + `org.omptray.Daemon` control interface;
   renders the spinner and reacts to `SetState`/`Stop`. Lifetime mirrors the omp
   process.
 - `ipc.ts` — shared DBus client: `daemonAlive`, `sendState`, `stopDaemon`.
   Each call opens its own session-bus connection, so there is **no** cross-
   connection FIFO — the controller serializes state changes itself (see below).
-- `controller.ts` — maps omp lifecycle events to `idle`/`working`/`error`
-  states and forwards them. Exposes `.state` for the `/tray debug` command.
+- `controller.ts` — maps omp turn events to `idle`/`working`/`error` states and
+  forwards them. `attach()` registers turn events only (`agent_start`,
+  `before_provider_request`, assistant `message_start`, `tool_execution_start`,
+  `tool_result`, `agent_end`; `turn_end` intentionally ignored) — `session_start`
+  is owned by `index.ts`. `reseed()` re-sends the current state; used by
+  `/tray restart` only. Exposes `.state` for the `/tray debug` command.
 - `icons.ts` — monochrome glyphs: `>` chevron + `_`, `X` (crossed strokes), 8 spinner frames.
 
 ### State mapping
@@ -40,7 +45,7 @@ omp process (transient)          tray daemon (tied to omp lifetime)
 |-------------|-----------|--------------|----------|
 | idle | `>_` prompt glyph | `Passive`→`Active` | `session_start` / `agent_end` |
 | working | spinning ring (~8 fps) | `Active` | `agent_start` / `before_provider_request` / `tool_execution_start` |
-| error | `X` crossed strokes | `NeedsAttention` | `tool_result` with `isError` (auto-clears after 5 s) |
+| error | `X` crossed strokes | `NeedsAttention` | `tool_result` with `isError` (auto-clears after 5 s, reverting to the pre-error `working`/`idle` state) |
 
 ### Key invariants (do not break)
 
@@ -55,7 +60,8 @@ omp process (transient)          tray daemon (tied to omp lifetime)
   signal-based exit paths (SIGHUP/SIGTERM) that skip `session.dispose()`. The
   daemon's own SIGTERM handler removes the SNI item cleanly. `process.kill` on an
   already-dead PID throws ESRCH — swallowed.
-- **Error is transient.** `flashError()` shows `X` for 5 s, then reverts. It is
+- **Error is transient.** The error flash shows `X` for 5 s, then reverts to
+  the pre-error state (`working` or `idle`) — not hardcoded `idle`. It is
   routed through the same chain so an un-awaited error send can't overtake a
   later idle/working.
 - **Tray IPC never blocks the agent loop.** `sendState` is a no-op if the daemon
@@ -102,7 +108,7 @@ the rules that govern this extension specifically:
 ```
 /tray                status   — show daemon running state (default)
 /tray stop  | off    stop     — stop the daemon
-/tray restart        restart  — stop + re-spawn
+/tray restart        restart  — stop + re-spawn (preserves the current state)
 /tray working        working  — force the tray to working
 /tray error          error    — force the tray to error
 /tray debug          debug    — show plugin/daemon state for troubleshooting
@@ -132,7 +138,7 @@ editor → dropdown). `/tray debug` reports: daemon running/ready/PID, plugin-si
 ```bash
 bun install                       # one-time; dbus-next only
 bunx tsc --noEmit                 # typecheck
-bun test controller.test.ts       # self-checks for the state chain
+bun test                          # self-checks (controller + icons)
 ```
 
 To test live against omp:
@@ -147,7 +153,7 @@ omp --extension ./.
 ```
 
 Iterating on `daemon.ts` / `index.ts` requires reloading omp — the extension is
-imported at startup, not hot-reloaded. `daemonReady` is re-checked on
+imported at startup, not hot-reloaded. `index.ts` calls `ensureDaemon()` on
 `session_start`, so `/compact` or a session switch will re-ensure the daemon.
 
 ### Code conventions
@@ -163,7 +169,7 @@ imported at startup, not hot-reloaded. `daemonReady` is re-checked on
   that prevents data loss, security.
 - **Each non-trivial logic unit leaves one runnable check behind** — an
   `assert`-based `demo()`/`__main__` self-check or one small `test_*.py` (here:
-  `controller.test.ts`). Trivial one-liners need no test.
+  `controller.test.ts`, `icons.test.ts`). Trivial one-liners need no test.
 - **DBus IPC patterns:** every connection is opened with a connect timeout and
   disconnected in a `finally`. `process.kill`/`bus.disconnect` on an already-dead
   target throws — always wrap in `try {} catch {}`.
@@ -200,7 +206,7 @@ Conventions:
 - Tags are required for `omp install` to detect updates: a spec
   without a ref pins the resolved HEAD SHA into `bun.lock` on first install and
   is then treated as satisfied — `omp` won't re-resolve against upstream. A
-  moving ref (`#master`) or a tag (`#v1.1.0`) gives omp/bun a reason to compare.
+  moving ref (`#master`) or a tag (`#v1.1.2`) gives omp/bun a reason to compare.
 - bun 1.3.x does NOT parse `#ref` in scp-style git URLs (`git@github.com:...git#tag`
   fails with "no commit matching"). Use the `github:owner/repo#ref` shorthand,
   which omp translates to `git+ssh://` and resolves the ref correctly.
@@ -209,7 +215,7 @@ Workflow:
 
 ```bash
 # 1. Make the change; verify.
-bunx tsc --noEmit && bun test controller.test.ts
+bunx tsc --noEmit && bun test
 
 # 2. Bump version in package.json (edit version: "x.y.z").
 
@@ -225,13 +231,13 @@ Install/update from a tag:
 ```bash
 # Users install a pinned version (use the github: shorthand — git@...#tag is not
 # parsed by bun):
-omp install github:Croissander/omp-tray-ext#v1.1.0
+omp install github:Croissander/omp-tray-ext#v1.1.2
 
 # Or the moving master ref (re-resolves more eagerly than a bare spec):
 omp install github:Croissander/omp-tray-ext#master
 
 # Force-reinstall to pick up a new tag/master HEAD after a stale lockfile:
-omp install --force github:Croissander/omp-tray-ext#v1.1.0
+omp install --force github:Croissander/omp-tray-ext#v1.1.2
 ```
 
 If `omp install --force` still resolves to the old SHA (bun sometimes treats an
@@ -242,7 +248,7 @@ manually and reinstall:
 rm -rf ~/.omp/plugins/node_modules/omp-tray-ext
 # drop the "omp-tray-ext" line from ~/.omp/plugins/package.json and bun.lock,
 # then reinstall with the new spec:
-omp install github:Croissander/omp-tray-ext#v1.1.0
+omp install github:Croissander/omp-tray-ext#v1.1.2
 ```
 
 ## Further reading

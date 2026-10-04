@@ -15,23 +15,21 @@ const { interface: iface } = dbus;
 interface WatcherIface {
   RegisterStatusNotifierItem(service: string): Promise<void>;
 }
-function watcherInterface(proxy: dbus.ProxyObject) {
-  return proxy.getInterface<WatcherIface & dbus.ClientInterface>("org.kde.StatusNotifierWatcher");
-}
-
-type BusWithName = dbus.MessageBus & { name: string | null };
-function busName(bus: dbus.MessageBus): string {
-  return (bus as BusWithName).name ?? "";
-}
 
 const SNI_IFACE = "org.kde.StatusNotifierItem";
 const SNI_PATH = "/StatusNotifierItem";
 const SNI_NAME = "org.kde.StatusNotifierItem.omptray";
 const SPINNER_INTERVAL_MS = 120;
 
+const pixmapCache = new WeakMap<Pixels, [number, number, Uint8Array]>();
 function pixmapOf(px: Pixels): [number, number, Uint8Array][] {
-  const { w, h, bytes } = toArgb(px);
-  return [[w, h, bytes]];
+  let entry = pixmapCache.get(px);
+  if (!entry) {
+    const { w, h, bytes } = toArgb(px);
+    entry = [w, h, bytes];
+    pixmapCache.set(px, entry);
+  }
+  return [entry];
 }
 
 class OmpTrayItem extends iface.Interface {
@@ -89,11 +87,8 @@ OmpTrayItem.configureMembers({
   },
 });
 
-
-
-// ponytail: the daemon's own control interface accepts SetState(s) + Stop().
 class DaemonControl extends iface.Interface {
-  constructor() {
+  constructor(private d: Daemon) {
     super(DAEMON_IFACE);
   }
   SetState(state: string) {
@@ -103,11 +98,11 @@ class DaemonControl extends iface.Interface {
       console.warn(`[omptray-daemon] ignoring invalid SetState: ${String(state)}`);
       return;
     }
-    daemon.setState(state);
+    this.d.setState(state);
   }
   Stop() {
     // Defer shutdown so the DBus reply for Stop() is delivered before exit.
-    setImmediate(() => daemon.shutdown());
+    setImmediate(() => this.d.shutdown());
   }
 }
 
@@ -132,6 +127,19 @@ class Daemon {
   private state: DaemonState = "idle";
   started = false;
 
+  /** The one place IconPixmap + ToolTip + NewIcon are built. */
+  private paint(px: Pixels, tooltip: string) {
+    if (!this.item) return;
+    const pixmap = pixmapOf(px);
+    this.item.IconPixmap = pixmap;
+    this.item.ToolTip = ["", pixmap, "omp", tooltip];
+    iface.Interface.emitPropertiesChanged(this.item, {
+      IconPixmap: this.item.IconPixmap,
+      ToolTip: this.item.ToolTip,
+    }, []);
+    this.item.NewIcon();
+  }
+
   private render() {
     if (!this.item) return;
     let px: Pixels;
@@ -150,17 +158,13 @@ class Daemon {
       status = "Active";
       tooltip = "Idle";
     }
-    this.item.IconPixmap = pixmapOf(px);
-    this.item.AttentionIconPixmap = this.state === "error" ? pixmapOf(px) : [];
+    this.paint(px, tooltip);
     this.item.Status = status;
-    this.item.ToolTip = ["", pixmapOf(px), "omp", tooltip];
+    this.item.AttentionIconPixmap = this.state === "error" ? pixmapOf(px) : [];
     iface.Interface.emitPropertiesChanged(this.item, {
       Status: this.item.Status,
-      IconPixmap: this.item.IconPixmap,
       AttentionIconPixmap: this.item.AttentionIconPixmap,
-      ToolTip: this.item.ToolTip,
     }, []);
-    this.item.NewIcon();
     this.item.NewStatus();
     this.item.NewAttentionIcon();
   }
@@ -171,16 +175,7 @@ class Daemon {
       this.frame = (this.frame + 1) % 8;
       if (this.state === "working") {
         // Only update the pixmap + signal; status stays "Active".
-        if (this.item) {
-          const px = spinnerFrameByIndex(this.frame);
-          this.item.IconPixmap = pixmapOf(px);
-          this.item.ToolTip = ["", pixmapOf(px), "omp", "Working"];
-          iface.Interface.emitPropertiesChanged(this.item, {
-            IconPixmap: this.item.IconPixmap,
-            ToolTip: this.item.ToolTip,
-          }, []);
-          this.item.NewIcon();
-        }
+        this.paint(spinnerFrameByIndex(this.frame), "Working");
       }
     }, SPINNER_INTERVAL_MS);
   }
@@ -225,7 +220,7 @@ class Daemon {
         // respawns us on the next session_start. Without this, a "working"
         // spinner interval keeps the process alive forever as a zombie.
         console.error("[omptray-daemon] session bus error:", (e as Error).message);
-        this.shutdown();
+        this.shutdown(1);
       }
     });
     const connected = await promise;
@@ -237,7 +232,7 @@ class Daemon {
     this.bus = bus;
 
     this.item = new OmpTrayItem();
-    this.control = new DaemonControl();
+    this.control = new DaemonControl(this);
     bus.export(SNI_PATH, this.item);
     bus.export(DAEMON_PATH, this.control);
     const reply = await bus.requestName(SNI_NAME, dbus.NameFlag.REPLACE_EXISTING | dbus.NameFlag.ALLOW_REPLACEMENT);
@@ -249,7 +244,9 @@ class Daemon {
 
     try {
       const watcherProxy = await bus.getProxyObject("org.kde.StatusNotifierWatcher", "/StatusNotifierWatcher");
-      await watcherInterface(watcherProxy).RegisterStatusNotifierItem(busName(bus));
+      const watcher = watcherProxy.getInterface<WatcherIface & dbus.ClientInterface>("org.kde.StatusNotifierWatcher");
+      const name = "name" in bus && typeof bus.name === "string" ? bus.name : "";
+      await watcher.RegisterStatusNotifierItem(name);
     } catch (e) {
       console.warn("[omptray-daemon] no StatusNotifierWatcher:", (e as Error).message);
     }
@@ -267,7 +264,7 @@ class Daemon {
     return true;
   }
 
-  shutdown() {
+  shutdown(exitCode = 0) {
     this.stopSpinner();
     const bus = this.bus;
     if (!bus) return;
@@ -285,7 +282,7 @@ class Daemon {
       this.started = false;
     }
     console.log("[omptray-daemon] stopped");
-    process.exit(0);
+    process.exit(exitCode);
   }
 }
 
