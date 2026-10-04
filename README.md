@@ -35,7 +35,7 @@ The extension registers a `/tray` slash command inside omp:
 ```
 /tray                show daemon running state (default)
 /tray stop | off     stop the daemon (tray icon disappears)
-/tray restart        stop + re-spawn the daemon
+/tray restart        stop + re-spawn the daemon (current state preserved)
 /tray working        force the tray to the working spinner
 /tray error          force the tray to the error glyph
 /tray debug          show plugin/daemon state for troubleshooting
@@ -120,6 +120,18 @@ release later: `omp install --force github:...#vX.Y.Z`.
 
 **Updating:** `git pull` in the cloned directory. No rebuild needed — omp
 imports the TypeScript directly via Bun.
+
+## Development
+
+```bash
+bun install          # one-time; dbus-next only
+bunx tsc --noEmit    # typecheck (strict)
+bun test             # full suite (controller.test.ts + icons.test.ts)
+```
+
+Contributing guidance lives in [AGENTS.md](AGENTS.md): architecture,
+invariants, code conventions, testing patterns, and the release/version
+policy (bump + tag + push — tags are what `omp install` keys on).
 
 ## Requirements
 

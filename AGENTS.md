@@ -1,14 +1,15 @@
-# AGENTS.md — omp-tray-ext
+# Repository Guidelines
 
-A native Linux status-bar tray for [Oh My Pi (omp)](https://omp.sh) that reflects
-agent state — idle, working, errored. Implements the freedesktop
-**StatusNotifierItem (SNI)** spec over the DBus session bus. No Electron/GTK/Qt;
-the icon bytes are drawn pixel-by-pixel and pushed as `IconPixmap` ARGB.
+## Project Overview
 
-This file is the ground-truth brief for any agent (or human) working in this repo.
-Read it before touching code.
+omp-tray-ext is a native Linux status-bar tray for [Oh My Pi (omp)](https://omp.sh)
+that reflects agent state — `idle`, `working`, `error`. A detached daemon
+implements the freedesktop **StatusNotifierItem (SNI)** spec over the DBus
+session bus and pushes pixel-drawn ARGB `IconPixmap` bytes; no Electron/GTK/Qt.
+Two processes: the omp extension (transient) and the tray daemon (lifetime tied
+to omp). This file is the ground-truth brief for any agent working here.
 
-## Architecture
+## Architecture & Data Flow
 
 ```
 omp process (transient)          tray daemon (tied to omp lifetime)
@@ -18,243 +19,240 @@ omp process (transient)          tray daemon (tied to omp lifetime)
 │  forward events │              │  spinner timer       │
 │  /tray command  │              │  IconPixmap (ARGB)   │
 └─────────────────┘              └──────────┬───────────┘
-                                  ▼
-                       KDE / GNOME / waybar panel
+                                            ▼
+                                 KDE / GNOME / waybar panel
 ```
 
-- `index.ts` — extension entry; owns `session_start`: `ensureDaemon()` then
-  `controller.force("idle")`. Spawns the daemon detached, forwards omp turn
-  events to it, registers the `/tray` slash command.
-- `daemon.ts` — owns the SNI item + `org.omptray.Daemon` control interface;
-  renders the spinner and reacts to `SetState`/`Stop`. Lifetime mirrors the omp
-  process.
-- `ipc.ts` — shared DBus client: `daemonAlive`, `sendState`, `stopDaemon`.
-  Each call opens its own session-bus connection, so there is **no** cross-
-  connection FIFO — the controller serializes state changes itself (see below).
-- `controller.ts` — maps omp turn events to `idle`/`working`/`error` states and
-  forwards them. `attach()` registers turn events only (`agent_start`,
-  `before_provider_request`, assistant `message_start`, `tool_execution_start`,
-  `tool_result`, `agent_end`; `turn_end` intentionally ignored) — `session_start`
-  is owned by `index.ts`. `reseed()` re-sends the current state; used by
-  `/tray restart` only. Exposes `.state` for the `/tray debug` command.
-- `icons.ts` — monochrome glyphs: `>` chevron + `_`, `X` (crossed strokes), 8 spinner frames.
+- `index.ts` — extension entry (`export default function ompTray(pi)`); daemon
+  lifetime (detached `Bun.spawn`, re-ensure, stop), owner of `session_start` /
+  `session_shutdown`, `/tray` command, exit-path SIGTERM fallback.
+- `controller.ts` — `TrayController`: maps omp turn events to `DaemonState`
+  (`"idle" | "working" | "error"`) and serializes sends on a promise chain.
+- `ipc.ts` — shared DBus contract (bus name `org.omptray.Daemon`, path/iface
+  `/org/omptray/Daemon`) + client `daemonAlive`, `sendState`, `stopDaemon`.
+  Each call opens its own session-bus connection.
+- `daemon.ts` — detached process owning the SNI item and the
+  `org.omptray.Daemon` control interface (`SetState`, `Stop`); spinner timer
+  (8 frames @120 ms), `paint()`/`render()` SNI updates.
+- `icons.ts` — pure 22×22 pixel glyphs (no font/image library): `>_` prompt,
+  `X` error, 8 spinner frames; RGBA→ARGB converter.
 
-### State mapping
+Exact flow: turn events (`agent_start`, `before_provider_request`,
+`tool_execution_start`, assistant `message_start`) → `working`; `tool_result`
+with `isError` → `error` flash (else `working`); `agent_end` → `idle`
+(`turn_end` is a deliberate no-op — it fires mid-loop). `index.ts` handles
+`session_start` (`ensureDaemon()` then `controller.force("idle")`) and
+`session_shutdown` (`stopDaemon()`). Sends call `SetState`; the daemon
+validates the state literal (trust boundary), then emits SNI properties
+(`IconPixmap`, `ToolTip`, `Status`, `AttentionIconPixmap`) plus
+`NewIcon`/`NewStatus`/`NewAttentionIcon`.
 
-| Agent state | Tray icon | SNI `Status` | Fires on |
-|-------------|-----------|--------------|----------|
-| idle | `>_` prompt glyph | `Passive`→`Active` | `session_start` / `agent_end` |
-| working | spinning ring (~8 fps) | `Active` | `agent_start` / `before_provider_request` / `tool_execution_start` |
-| error | `X` crossed strokes | `NeedsAttention` | `tool_result` with `isError` (auto-clears after 5 s, reverting to the pre-error `working`/`idle` state) |
+| Agent state | Icon | SNI `Status` | Trigger |
+|---|---|---|---|
+| idle | `>_` | `Active` | `session_start` (via `force`) / `agent_end` |
+| working | spinning ring (8 frames, ~8 fps) | `Active` | turn events (see above) |
+| error | `X` | `NeedsAttention` | `tool_result` with `isError`; auto-clears after 5 s back to the **pre-error** state |
 
 ### Key invariants (do not break)
 
-- **State transitions are serialized through `TrayController.chain`.** Each
-  `sendState` opens its own DBus connection with no cross-connection ordering,
-  so two concurrent transitions can reorder — a stale "working" landing after a
-  later "idle" leaves the tray spinning forever. The promise-chain forces call B
-  to wait for call A's `sendState` to resolve before starting. The chain also
-  `.catch()`es so a failing send can't wedge every later state.
-- **The daemon is tied to the omp process lifetime.** Spawned at load,
-  stopped on `session_shutdown`. A last-resort `process.on("exit")` SIGTERM covers
-  signal-based exit paths (SIGHUP/SIGTERM) that skip `session.dispose()`. The
-  daemon's own SIGTERM handler removes the SNI item cleanly. `process.kill` on an
-  already-dead PID throws ESRCH — swallowed.
-- **Error is transient.** The error flash shows `X` for 5 s, then reverts to
-  the pre-error state (`working` or `idle`) — not hardcoded `idle`. It is
-  routed through the same chain so an un-awaited error send can't overtake a
-  later idle/working.
-- **Tray IPC never blocks the agent loop.** `sendState` is a no-op if the daemon
-  isn't running. Every `await` of it is fire-and-forget at the omp level.
+- **State transitions serialize through `TrayController.chain`.** Each
+  `sendState` opens its own DBus connection with no cross-connection FIFO, so
+  concurrent transitions can reorder — a stale "working" landing after a later
+  "idle" leaves the tray spinning forever. The chain forces call B to wait for
+  call A's `sendState` to resolve; it `.catch()`es so a failing send can't
+  wedge every later state.
+- **The daemon is tied to the omp process lifetime.** Spawned at load, stopped
+  on `session_shutdown`; a last-resort `process.on("exit")` SIGTERM covers
+  signal exits (SIGHUP/SIGTERM) that skip `session.dispose()`. The daemon's
+  SIGTERM handler removes the SNI item cleanly. `process.kill`/
+  `bus.disconnect` on a dead target throws ESRCH — swallowed in `try/catch`.
+- **Error is transient.** `flashError()` shows `X` for `errorMs` (default
+  5 s), then reverts to the pre-error state — not hardcoded `idle`. Routed
+  through the same chain so an un-awaited error send can't overtake a later
+  idle/working.
+- **Tray IPC never blocks the agent loop.** `sendState` is a no-op if the
+  daemon isn't running; every `await` of it is fire-and-forget at omp level.
 
-## omp extension authoring — what applies here
-
-Authoritative docs: <https://omp.sh/docs/extension-authoring> and
-<https://github.com/can1357/oh-my-pi/blob/main/docs/extensions.md>. Summary of
-the rules that govern this extension specifically:
-
-- **Factory signature.** `export default function ompTray(pi: ExtensionAPI)`.
-  Register handlers/tools/commands during load; runtime actions
-  (`sendMessage`, `setActiveTools`, …) throw `ExtensionRuntimeNotInitializedError`
-  if called synchronously during module evaluation. We only register + spawn the
-  daemon on load — fine.
-- **Command names must not clash with built-ins.** omp reserves
-  `BUILTIN_SLASH_COMMAND_RESERVED_NAMES` (built from the builtin registry). The
-  extension runner **silently skips** a registered command whose name is in that
-  set, logging a diagnostic. That is why `debug` lives as `/tray debug`, not as a
-  separate `/debug` (omp ships a builtin `/debug`).
-- **Command argument autocompletion** is provided via
-  `getArgumentCompletions(argumentPrefix)`. Convention (mirroring the builtins):
-  return `AutocompleteItem[] | null`. Filter by prefix; `null` when no match or
-  after a space (past the subcommand). Each item is
-  `{ value: "<sub> ", label, description? }` — note the trailing space in `value`.
-  Must be side-effect-free (it runs synchronously on each keystroke).
-- **No DBus/GUI deps beyond `dbus-next`.** Pure JS, no native build. The daemon
-  is spawned with `bun run` (TS imported directly — omp loads extensions via Bun).
-- **Logs.** omp writes structured logs to `~/.omp/logs/omp.$(date +%F).log`. The
-  daemon logs to its own stderr (currently `stdio: "ignore"` on the spawn —
-  flip to a file if debugging spawn failures). Extension logs via `pi.logger`.
-- **Disable temporarily** without removing the file:
-  ```yaml
-  # ~/.omp/agent/config.yml
-  disabledExtensions:
-    - omp-tray-ext
-  ```
-  The derived name is the filename stem / directory name — here `omp-tray-ext`
-  per `package.json#name`.
-
-## Slash command surface (`/tray`)
+### Slash-command surface (`/tray`)
 
 ```
 /tray                status   — show daemon running state (default)
 /tray stop  | off    stop     — stop the daemon
-/tray restart        restart  — stop + re-spawn (preserves the current state)
-/tray working        working  — force the tray to working
-/tray error          error    — force the tray to error
-/tray debug          debug    — show plugin/daemon state for troubleshooting
+/tray restart        restart  — stop + re-spawn (preserves current state)
+/tray working        working  — force working
+/tray error          error    — force error
+/tray debug          debug    — plugin/daemon state for troubleshooting
 ```
 
-All subcommands are prefix-filtered by `getArgumentCompletions` (typed in the
-editor → dropdown). `/tray debug` reports: daemon running/ready/PID, plugin-side
-`TrayController.state`, daemon script path, active model, agent idle, cwd.
+## Key Directories
 
-## Development practices
+Flat root — no `src/`; all source, tests, and config live beside each other:
 
-### Environment
+- `*.ts` at root — five modules + two test files (see Important Files).
+- `node_modules/` — `bun install` output (gitignored).
+- `.zcode/` — local session/plan artifacts (gitignored).
+- Committed at root: `README.md`, `AGENTS.md`, `LICENSE`, `package.json`,
+  `tsconfig.json`, `bun.lock` (deliberately committed — see below).
 
-- Runtime: `bun` (the extension and daemon import TS directly; omp loads via
-  Bun). Required by users at runtime too.
-- Target: a Linux desktop with a DBus session bus and an SNA host (KDE Plasma,
-  GNOME + Appindicator, waybar tray module, swaync/swaybar, …).
-- TypeScript is a `peerDependency`; `@types/bun` is a dev type source.
-  `@oh-my-pi/pi-coding-agent` is a **devDependency used for types only** —
-  every import is `import type`, erased at runtime by Bun. omp binaries are
-  compiled ELF and don't expose `.d.ts` on the host, so the types come from
-  npm (`bun add -d @oh-my-pi/pi-coding-agent`). Never move it to
-  `dependencies` and never import it at runtime.
-
-### Local dev loop
+## Development Commands
 
 ```bash
 bun install                       # one-time; dbus-next only
-bunx tsc --noEmit                 # typecheck
-bun test                          # self-checks (controller + icons)
+bunx tsc --noEmit                 # typecheck (strict) — after every change
+bun test                          # full suite (2 files)
+bun test controller.test.ts       # single file (each header states its command)
+bun ./icons.ts                    # render glyphs, print pixel counts (visual check)
 ```
 
-To test live against omp:
+Live test against omp (the extension is imported at startup — no hot reload;
+restart omp to re-iterate):
 
 ```bash
-# Option A — installed as a user extension
-ln -s "$PWD" ~/.omp/agent/extensions/omp-tray-ext   # or git clone there
-# Restart omp; the daemon spawns at load and the tray appears in the panel.
-
-# Option B — load once via CLI flag
-omp --extension ./.
+ln -s "$PWD" ~/.omp/agent/extensions/omp-tray-ext   # Option A: user extension
+omp --extension ./.                                  # Option B: one-shot load
 ```
 
-Iterating on `daemon.ts` / `index.ts` requires reloading omp — the extension is
-imported at startup, not hot-reloaded. `index.ts` calls `ensureDaemon()` on
-`session_start`, so `/compact` or a session switch will re-ensure the daemon.
+`daemonReady` is re-checked on `session_start`, so `/compact` or a session
+switch re-ensures the daemon. Troubleshooting: `/tray debug` inside omp; omp
+logs to `~/.omp/logs/omp.$(date +%F).log`; the daemon logs to its own stderr
+(the spawn is `stdio: "ignore"` — flip to a file to debug spawn failures).
+Disable without uninstalling:
 
-### Code conventions
+```yaml
+# ~/.omp/agent/config.yml
+disabledExtensions:
+  - omp-tray-ext        # derived from package.json#name
+```
 
-- **Ponytail by default.** Lazy = efficient, not careless. The ladder:
-  does it need to exist? → stdlib → native platform feature → already-installed
-  dep → one line → minimum code that works. Mark deliberate simplifications with
-  `// ponytail: <shortcut>; upgrade path <X>`.
-- **No unrequested abstractions.** No interface with one implementation, no
-  factory for one product, no config for a value that never changes. Deletion
-  over addition; boring over clever.
-- **Never simplify away** input validation at trust boundaries, error handling
-  that prevents data loss, security.
-- **Each non-trivial logic unit leaves one runnable check behind** — an
-  `assert`-based `demo()`/`__main__` self-check or one small `test_*.py` (here:
-  `controller.test.ts`, `icons.test.ts`). Trivial one-liners need no test.
-- **DBus IPC patterns:** every connection is opened with a connect timeout and
-  disconnected in a `finally`. `process.kill`/`bus.disconnect` on an already-dead
-  target throws — always wrap in `try {} catch {}`.
-- **Use `Promise.withResolvers()`** instead of `new Promise((resolve) => ...)`.
-- **Don't extract one-expression functions.** Inline unless the name creates a
-  durable contract (test seam, DI boundary, public API, type guard).
+### Commits & release/version policy ⚠️
 
-### Editing discipline
+After every bigger change: bump `package.json#version`, commit, tag `vX.Y.Z` on
+the **same commit**, push. "Bigger" = user-visible behavior change, new
+command/state, DBus contract change, or anything touching the `daemon.ts` /
+`ipc.ts` / `controller.ts` invariants. Behavior-identical refactors and
+docs-only commits need no bump.
 
-- Prefer the `edit` tool for surgical changes; `write` only for new files or
-  full overwrites.
-- Re-read a file before editing if a tool failed or the file changed since.
-- Grep/glob to locate targets; read sections, not whole files. Don't open files
-  hoping.
-- Run `lsp references` before modifying exported symbols — missed callsites are
-  bugs.
-- Run `bunx tsc --noEmit` and the affected `bun test` after every non-trivial
-  change. Tests assert behavior, not current state.
-
-## Release / version policy  ⚠️
-
-**After every bigger change, bump the version in `package.json`, tag, and push
-to GitHub.** "Bigger" = any user-visible behavior change, new command, new state,
-DBus contract change, or anything touching `daemon.ts`/`ipc.ts`/`controller.ts`
-invariants. Pure refactor of identical behavior with no observable change does
-not require a bump.
-
-Conventions:
-
-- `package.json#version` and the matching git tag `vX.Y.Z` are the source of
-  truth. Both must move together: bump the field, then tag the same commit.
-- Semver-leaning: `1.0.1 → 1.0.2` for fixes/patches, → `1.1.0` for new
-  commands/states, → `2.0.0` for a DBus contract break.
-- Tags are required for `omp install` to detect updates: a spec
-  without a ref pins the resolved HEAD SHA into `bun.lock` on first install and
-  is then treated as satisfied — `omp` won't re-resolve against upstream. A
-  moving ref (`#master`) or a tag (`#v1.1.2`) gives omp/bun a reason to compare.
-- bun 1.3.x does NOT parse `#ref` in scp-style git URLs (`git@github.com:...git#tag`
-  fails with "no commit matching"). Use the `github:owner/repo#ref` shorthand,
-  which omp translates to `git+ssh://` and resolves the ref correctly.
-
-Workflow:
+- Commit style: `<type>[(scope)]: <what> (vX.Y.Z)`; version suffix only on
+  behavior commits (e.g. `fix: route reseed through the chain (v1.1.1)`,
+  `docs(readme): ...`).
+- Semver-leaning: → patch for fixes, → minor for new commands/states, → major
+  for a DBus contract break.
+- Tags are REQUIRED for `omp install` to detect updates: a bare spec pins the
+  first-resolved HEAD SHA into `bun.lock` and is then treated as satisfied.
+- bun 1.3.x does NOT parse `#ref` in scp-style git URLs
+  (`git@github.com:...git#tag` fails) — always use `github:owner/repo#ref`.
 
 ```bash
-# 1. Make the change; verify.
-bunx tsc --noEmit && bun test
-
-# 2. Bump version in package.json (edit version: "x.y.z").
-
-# 3. Commit, tag, push.
-git add -A
-git commit -m "<scope>: <what changed> (vX.Y.Z)"
-git tag vX.Y.Z
-git push origin master --tags
+bunx tsc --noEmit && bun test     # gates first — never commit red
+git add -A && git commit -m "<scope>: <what changed> (vX.Y.Z)"
+git tag vX.Y.Z && git push origin master --tags
 ```
 
-Install/update from a tag:
-
-```bash
-# Users install a pinned version (use the github: shorthand — git@...#tag is not
-# parsed by bun):
-omp install github:Croissander/omp-tray-ext#v1.1.2
-
-# Or the moving master ref (re-resolves more eagerly than a bare spec):
-omp install github:Croissander/omp-tray-ext#master
-
-# Force-reinstall to pick up a new tag/master HEAD after a stale lockfile:
-omp install --force github:Croissander/omp-tray-ext#v1.1.2
-```
-
-If `omp install --force` still resolves to the old SHA (bun sometimes treats an
-existing satisfied lockfile entry as enough), remove the stale resolution
-manually and reinstall:
+Stale-lockfile recovery when `omp install --force` still resolves an old SHA:
 
 ```bash
 rm -rf ~/.omp/plugins/node_modules/omp-tray-ext
-# drop the "omp-tray-ext" line from ~/.omp/plugins/package.json and bun.lock,
-# then reinstall with the new spec:
-omp install github:Croissander/omp-tray-ext#v1.1.2
+# drop the "omp-tray-ext" line from ~/.omp/plugins/package.json and bun.lock
+omp install github:Croissander/omp-tray-ext#vX.Y.Z
 ```
 
-## Further reading
+## Code Conventions & Common Patterns
 
-- omp extension authoring — <https://omp.sh/docs/extension-authoring>
-- omp extension runtime internals —
-  <https://github.com/can1357/oh-my-pi/blob/main/docs/extensions.md>
-- SNI spec — <https://www.freedesktop.org/wiki/Specifications/StatusNotifierItem/>
-- dbus-next — <https://github.com/dbusjs/node-dbus-next>
+- **Ponytail by default** (lazy = efficient): does it need to exist? → stdlib →
+  platform feature → installed dep → one line → minimum code that works. Mark
+  deliberate shortcuts with `// ponytail: <shortcut>; upgrade path <X>`.
+- **No unrequested abstractions**: no one-implementation interfaces, no
+  factories for one product, no config for a value that never changes. Deletion
+  over addition; boring over clever.
+- **Don't extract one-expression functions** — inline unless the name is a
+  durable contract (test seam, DI boundary, public API, type guard).
+- **`Promise.withResolvers()`**, never `new Promise((resolve) => ...)`.
+- **DBus discipline**: connect with a timeout, disconnect in `finally`, wrap
+  `process.kill`/`bus.disconnect` in `try/catch`. DBus method args are a trust
+  boundary — validate literals (see `DaemonControl.SetState`).
+- **DI seams**: `TrayController`'s `send` and `errorMs` constructor params are
+  `@internal` injectables for tests; tests drive privates via
+  `c["transition"](...)`. Follow this shape for new testable logic.
+- **Never simplify away** trust-boundary validation, error handling that
+  prevents data loss, security, accessibility basics.
+- Comments explain *why* (races, invariants), not what. JSDoc exported
+  symbols. Editing: surgical `edit` over rewrites; grep/glob to locate, read
+  ranges; `lsp references` before changing an exported symbol.
+
+### omp extension-authoring rules (apply here)
+
+Authoritative: <https://omp.sh/docs/extension-authoring>,
+<https://github.com/can1357/oh-my-pi/blob/main/docs/extensions.md>.
+
+- Factory: `export default function ompTray(pi: ExtensionAPI)`. Register
+  handlers/tools/commands at load only — runtime actions (`sendMessage`,
+  `setActiveTools`, …) throw `ExtensionRuntimeNotInitializedError` if called
+  during module evaluation.
+- Command names must not clash with `BUILTIN_SLASH_COMMAND_RESERVED_NAMES` —
+  the runner **silently skips** conflicts (why `/tray debug`, not `/debug`).
+- `getArgumentCompletions(argumentPrefix)` contract: `AutocompleteItem[] |
+  null`, prefix-filtered, `null` after a space or on no match; each item's
+  `value` carries a **trailing space** (`"<sub> "`); side-effect-free (runs on
+  every keystroke).
+
+## Important Files
+
+| Path | Role |
+|---|---|
+| `index.ts` | Extension entry (`ompTray` factory), daemon lifetime, `/tray` |
+| `daemon.ts` | Detached SNI daemon: `Daemon`, `DaemonControl`, `import.meta.main` entry |
+| `controller.ts` | `TrayController` — event→state mapping + serialized chain |
+| `ipc.ts` | DBus contract constants + client (`daemonAlive`/`sendState`/`stopDaemon`) |
+| `icons.ts` | Glyph drawing + ARGB conversion; `import.meta.main` visual demo |
+| `controller.test.ts` | Chain-ordering/state-machine suite (bun:test) |
+| `icons.test.ts` | Pixel/ARGB correctness suite (bun:test) |
+| `package.json` | `omp.extensions` load hook; `name` doubles as `disabledExtensions` key; `version` couples to git tag |
+| `tsconfig.json` | Strict flags — see Runtime/Tooling Preferences |
+| `bun.lock` | Committed lockfile; pinned SHAs affect `omp install` update detection |
+
+## Runtime/Tooling Preferences
+
+- **Bun is required** (for users too): the extension and daemon are TypeScript
+  run directly — no build step, no emitted JS (`noEmit`,
+  `allowImportingTsExtensions`). Spawn uses `process.execPath` (the bun binary
+  itself), never `"bun"` from PATH.
+- **Package manager**: bun (`bun.lock` committed). Node is not supported.
+- **Dependencies**: `dbus-next` is the only runtime dep (pure JS — no native
+  builds, keep it that way). `@oh-my-pi/pi-coding-agent` is a devDependency
+  for **types only** — every import is `import type`, erased at runtime
+  (omp binaries are compiled ELF with no `.d.ts`). Never move it to
+  `dependencies`, never import it at runtime. `typescript` is a peerDependency.
+- **tsconfig consequences**: `noUncheckedIndexedAccess` → typed-array indexing
+  needs `?? 0` guards; `verbatimModuleSyntax` → type-only imports must use
+  `import type`; plus `strict`, `noImplicitOverride`,
+  `noFallthroughCasesInSwitch`.
+- **No formatter or linter is configured** — match surrounding style; don't
+  add tooling unrequested.
+
+## Testing & QA
+
+- Framework: **bun:test** (`import { test, expect } from "bun:test"`), flat
+  `*.test.ts` beside sources. Full suite `bun test`; each file's header
+  comment states its single-file command.
+- `controller.test.ts` pins the ordering invariants: FIFO chain under send
+  reordering, error flash can't overtake a later idle, `force` bypasses the
+  dedupe, `reseed` replays state after a daemon respawn, flash dedupe +
+  revert to the **pre-error** state after `errorMs`.
+- `icons.test.ts` pins pixel correctness: `[a,r,g,b]` byte order, visible
+  glyphs/frames, pairwise-distinct spinner frames, 8-frame wraparound, shared
+  pre-rendered glyph instances.
+- Patterns to reuse: `stubApi()` double (tests never touch DBus — inject
+  `send`), `drain()` macrotask yield that settles the chain regardless of
+  microtask hop count, `void c["transition"](...)` to fire internals the way
+  omp does (un-awaited handlers), real-timer waits through the `errorMs` seam
+  (`new TrayController(api, send, 10)`).
+- Standard: every non-trivial logic unit leaves **one runnable check** behind
+  (assert-based self-check or one small test file); trivial one-liners need
+  none. Tests assert behavior, not implementation — no wiring/echo/tautology
+  tests; existing wording/implementation tests get deleted, never re-pinned.
+- Gates before every commit: `bunx tsc --noEmit && bun test`. Never commit a
+  red tree; run the suite once across the union of changed files.
+
+Further reading: SNI spec —
+<https://www.freedesktop.org/wiki/Specifications/StatusNotifierItem/>;
+dbus-next — <https://github.com/dbusjs/node-dbus-next>.
