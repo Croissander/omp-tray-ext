@@ -52,9 +52,9 @@ function connectBus(timeoutMs = 3000): Promise<BusConnection> {
   });
 }
 
-/** Ping the daemon: returns true if reachable. */
-export async function daemonAlive(): Promise<boolean> {
-  const conn = await connectBus();
+/** Ping the daemon: returns true if reachable. `timeoutMs` bounds the bus connect. */
+export async function daemonAlive(timeoutMs = 3000): Promise<boolean> {
+  const conn = await connectBus(timeoutMs);
   if (!conn.ok || !conn.bus) return false;
   try {
     const dbusProxy = await conn.bus.getProxyObject("org.freedesktop.DBus", "/org/freedesktop/DBus");
@@ -68,18 +68,21 @@ export async function daemonAlive(): Promise<boolean> {
 }
 
 /**
- * Send a state update to the daemon. No-op if the daemon isn't running so the
- * extension never blocks the agent loop on tray IPC.
+ * Send a state update to the daemon. Resolves true iff the daemon accepted it;
+ * false when the daemon is unreachable or the send fails — the caller decides
+ * on recovery. Never blocks the agent loop on tray IPC.
  */
-export async function sendState(state: DaemonState): Promise<void> {
+export async function sendState(state: DaemonState): Promise<boolean> {
   const conn = await connectBus();
-  if (!conn.ok || !conn.bus) return;
+  if (!conn.ok || !conn.bus) return false;
   try {
     const proxy = await conn.bus.getProxyObject(DAEMON_NAME, DAEMON_PATH);
     const control = proxy.getInterface<DaemonControlIface & dbus.ClientInterface>(DAEMON_IFACE);
     await control.SetState(state);
+    return true;
   } catch {
-    // Daemon not up yet, or vanished — silently drop; the extension will retry.
+    // Daemon not up yet, or vanished — caller recovers (respawn + reseed).
+    return false;
   } finally {
     try { conn.bus.disconnect(); } catch {}
   }

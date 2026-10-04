@@ -6,13 +6,13 @@ omp-tray-ext is a native Linux status-bar tray for [Oh My Pi (omp)](https://omp.
 that reflects agent state — `idle`, `working`, `error`. A detached daemon
 implements the freedesktop **StatusNotifierItem (SNI)** spec over the DBus
 session bus and pushes pixel-drawn ARGB `IconPixmap` bytes; no Electron/GTK/Qt.
-Two processes: the omp extension (transient) and the tray daemon (lifetime tied
-to omp). This file is the ground-truth brief for any agent working here.
+Two processes: the omp extension (transient) and the tray daemon (one shared
+per session bus). This file is the ground-truth brief for any agent working here.
 
 ## Architecture & Data Flow
 
 ```
-omp process (transient)          tray daemon (tied to omp lifetime)
+omp process (transient)          tray daemon (one per session bus)
 ┌─────────────────┐              ┌──────────────────────┐
 │ index.ts        │  SetState(s) │ daemon.ts            │
 │  spawn daemon   │──── DBus ───▶│  owns SNI on bus     │
@@ -24,13 +24,15 @@ omp process (transient)          tray daemon (tied to omp lifetime)
 ```
 
 - `index.ts` — extension entry (`export default function ompTray(pi)`); daemon
-  lifetime (detached `Bun.spawn`, re-ensure, stop), owner of `session_start` /
-  `session_shutdown`, `/tray` command, exit-path SIGTERM fallback.
+  lifetime (detached `Bun.spawn`, re-ensure, `recover()` on failed sends),
+  owner of `session_start` / `session_shutdown`, `/tray` command, PID-checked
+  exit kill (`killOwnDaemon`).
 - `controller.ts` — `TrayController`: maps omp turn events to `DaemonState`
   (`"idle" | "working" | "error"`) and serializes sends on a promise chain.
 - `ipc.ts` — shared DBus contract (bus name `org.omptray.Daemon`, path/iface
-  `/org/omptray/Daemon`) + client `daemonAlive`, `sendState`, `stopDaemon`.
-  Each call opens its own session-bus connection.
+  `/org/omptray/Daemon`) + client `daemonAlive(timeoutMs?)`, `sendState`
+  (resolves `false` on failure), `stopDaemon`. Each call opens its own
+  session-bus connection.
 - `daemon.ts` — detached process owning the SNI item and the
   `org.omptray.Daemon` control interface (`SetState`, `Stop`); spinner timer
   (8 frames @120 ms), `paint()`/`render()` SNI updates.
@@ -42,7 +44,8 @@ Exact flow: turn events (`agent_start`, `before_provider_request`,
 with `isError` → `error` flash (else `working`); `agent_end` → `idle`
 (`turn_end` is a deliberate no-op — it fires mid-loop). `index.ts` handles
 `session_start` (`ensureDaemon()` then `controller.force("idle")`) and
-`session_shutdown` (`stopDaemon()`). Sends call `SetState`; the daemon
+`session_shutdown` (`killOwnDaemon()` — PID-targeted, never another omp's
+daemon). Sends call `SetState`; the daemon
 validates the state literal (trust boundary), then emits SNI properties
 (`IconPixmap`, `ToolTip`, `Status`, `AttentionIconPixmap`) plus
 `NewIcon`/`NewStatus`/`NewAttentionIcon`.
@@ -61,17 +64,24 @@ validates the state literal (trust boundary), then emits SNI properties
   "idle" leaves the tray spinning forever. The chain forces call B to wait for
   call A's `sendState` to resolve; it `.catch()`es so a failing send can't
   wedge every later state.
-- **The daemon is tied to the omp process lifetime.** Spawned at load, stopped
-  on `session_shutdown`; a last-resort `process.on("exit")` SIGTERM covers
-  signal exits (SIGHUP/SIGTERM) that skip `session.dispose()`. The daemon's
+- **One daemon per session bus (shared slot).** The control name is claimed
+  with `REPLACE_EXISTING | ALLOW_REPLACEMENT`; a non-`PRIMARY_OWNER` reply
+  exits before watcher registration, and a later displacement (re-checked
+  after 500 ms) exits the loser — never steal the name back (no ping-pong).
+  Process teardown (`session_shutdown` + `process.on("exit")`) signals only a
+  daemon this process spawned: `killOwnDaemon()` verifies identity via
+  `/proc/<pid>/cmdline` before SIGTERM (PID-reuse guard). The daemon's
   SIGTERM handler removes the SNI item cleanly. `process.kill`/
   `bus.disconnect` on a dead target throws ESRCH — swallowed in `try/catch`.
 - **Error is transient.** `flashError()` shows `X` for `errorMs` (default
   5 s), then reverts to the pre-error state — not hardcoded `idle`. Routed
   through the same chain so an un-awaited error send can't overtake a later
   idle/working.
-- **Tray IPC never blocks the agent loop.** `sendState` is a no-op if the
-  daemon isn't running; every `await` of it is fire-and-forget at omp level.
+- **Tray IPC never blocks the agent loop.** `sendState` resolves `false` when
+  the daemon is unreachable; the `send` seam then fires `recover()` (respawn +
+  `reseed()`) — single-flight and NEVER awaited from inside
+  `TrayController.chain` (reseed enqueues on the chain; awaiting it from a
+  chain job deadlocks the chain against itself).
 
 ### Slash-command surface (`/tray`)
 
@@ -88,7 +98,7 @@ validates the state literal (trust boundary), then emits SNI properties
 
 Flat root — no `src/`; all source, tests, and config live beside each other:
 
-- `*.ts` at root — five modules + two test files (see Important Files).
+- `*.ts` at root — five modules + three test files (see Important Files).
 - `node_modules/` — `bun install` output (gitignored).
 - `.zcode/` — local session/plan artifacts (gitignored).
 - Committed at root: `README.md`, `AGENTS.md`, `LICENSE`, `package.json`,
@@ -99,7 +109,7 @@ Flat root — no `src/`; all source, tests, and config live beside each other:
 ```bash
 bun install                       # one-time; dbus-next only
 bunx tsc --noEmit                 # typecheck (strict) — after every change
-bun test                          # full suite (2 files)
+bun test                          # full suite (3 files)
 bun test controller.test.ts       # single file (each header states its command)
 bun ./icons.ts                    # render glyphs, print pixel counts (visual check)
 ```
@@ -206,6 +216,8 @@ Authoritative: <https://omp.sh/docs/extension-authoring>,
 | `icons.ts` | Glyph drawing + ARGB conversion; `import.meta.main` visual demo |
 | `controller.test.ts` | Chain-ordering/state-machine suite (bun:test) |
 | `icons.test.ts` | Pixel/ARGB correctness suite (bun:test) |
+| `daemon.test.ts` | `stateView` render-mapping suite (bun:test) |
+| `.github/workflows/ci.yml` | CI: `bun install --frozen-lockfile` + gates on push/PR |
 | `package.json` | `omp.extensions` load hook; `name` doubles as `disabledExtensions` key; `version` couples to git tag |
 | `tsconfig.json` | Strict flags — see Runtime/Tooling Preferences |
 | `bun.lock` | Committed lockfile; pinned SHAs affect `omp install` update detection |
@@ -241,6 +253,9 @@ Authoritative: <https://omp.sh/docs/extension-authoring>,
 - `icons.test.ts` pins pixel correctness: `[a,r,g,b]` byte order, visible
   glyphs/frames, pairwise-distinct spinner frames, 8-frame wraparound, shared
   pre-rendered glyph instances.
+- `daemon.test.ts` pins the render mapping (`stateView`): exact
+  status/tooltip/attention literals per state and shared pre-rendered glyph
+  instances (`===` identity); importing `daemon.ts` is side-effect-free.
 - Patterns to reuse: `stubApi()` double (tests never touch DBus — inject
   `send`), `drain()` macrotask yield that settles the chain regardless of
   microtask hop count, `void c["transition"](...)` to fire internals the way

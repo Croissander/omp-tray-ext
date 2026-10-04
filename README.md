@@ -45,9 +45,11 @@ Subcommands autocomplete as you type them.
 
 ## Architecture
 
-A **detached daemon** owns the tray; the omp extension spawns it at load
-and stops it on quit, forwarding state over DBus IPC. The tray mirrors the
-omp process lifetime.
+A **detached daemon** owns the tray; the omp extension spawns it at load and
+signals it on quit, forwarding state over DBus IPC. One daemon serves every
+omp on the session bus (single shared icon, last writer wins); process
+teardown stops only the daemon that instance spawned. A daemon dying
+mid-turn is respawned on the next state event.
 
 ```
 omp process (transient)          tray daemon (tied to omp lifetime)
@@ -63,7 +65,7 @@ omp process (transient)          tray daemon (tied to omp lifetime)
 
 - `index.ts` — extension entry; owns `session_start` (`ensureDaemon()` then
   `controller.force("idle")`), spawns the daemon detached, forwards turn events,
-  registers the `/tray` command.
+  respawns + reseeds on a failed send, registers the `/tray` command.
 - `daemon.ts` — owns the SNI item + `org.omptray.Daemon` control interface;
   renders the spinner and responds to `SetState`/`Stop`.
 - `ipc.ts` — shared DBus client: `daemonAlive`, `sendState`, `stopDaemon`.
@@ -109,7 +111,7 @@ omp --extension ./omp-tray-ext
 **Option D — install via the `omp` CLI (pinned to a release tag):**
 
 ```bash
-omp install github:Croissander/omp-tray-ext#v1.1.2
+omp install github:Croissander/omp-tray-ext#v1.2.0
 ```
 
 Always install with a `#vX.Y.Z` tag (or `#master`) — a bare `git@...` spec gets
@@ -126,7 +128,7 @@ imports the TypeScript directly via Bun.
 ```bash
 bun install          # one-time; dbus-next only
 bunx tsc --noEmit    # typecheck (strict)
-bun test             # full suite (controller.test.ts + icons.test.ts)
+bun test             # full suite (controller + icons + daemon tests)
 ```
 
 Contributing guidance lives in [AGENTS.md](AGENTS.md): architecture,
@@ -141,9 +143,8 @@ policy (bump + tag + push — tags are what `omp install` keys on).
 
 ## Limitations
 
-- **One tray per session bus.** The daemon claims a fixed DBus name with
-  `REPLACE_EXISTING`, so launching a second omp instance steals the tray icon
-  from the first; both instances' states then interleave on a single icon.
-- **Daemon recovery waits for `session_start`.** If the daemon dies mid-turn,
-  the tray stays gone until the next session start (or `/tray restart`);
-  state events sent in between are dropped silently.
+- **One tray icon per session bus (by design).** Concurrent omp instances
+  share a single icon and their states interleave on it (last writer wins).
+  Exactly one daemon serves the bus — a newer instance takes the slot over
+  atomically and the previous daemon exits cleanly. Per-instance icons are
+  the upgrade path if interleaving becomes a problem.

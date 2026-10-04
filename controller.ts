@@ -40,8 +40,9 @@ export class TrayController {
 
   constructor(
     private pi: ExtensionAPI,
-    /** @internal injectable for tests; defaults to the DBus client. */
-    private send: (s: DaemonState) => Promise<void> = sendState,
+    /** @internal injectable for tests; defaults to the DBus client.
+     *  The controller ignores the result (ipc.sendState reports success). */
+    private send: (s: DaemonState) => Promise<unknown> = sendState,
     /** @internal injectable for tests; error flash duration in ms. */
     private errorMs = 5000,
   ) {}

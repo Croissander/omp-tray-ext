@@ -1,15 +1,17 @@
 // oh-my-pi tray extension: a native Linux status-bar indicator.
 //
 // Spawns a detached daemon (daemon.ts) that owns the DBus StatusNotifierItem.
-// The daemon is started at load and stopped on omp quit, so the tray mirrors
-// the omp session's lifetime. The extension forwards agent lifecycle events
-// to the daemon over DBus IPC. The tray shows:
+// One daemon serves every omp on the session bus (shared icon, last writer
+// wins); teardown signals only the daemon this process spawned. The extension
+// forwards agent lifecycle events to the daemon over DBus IPC and respawns it
+// mid-turn when a send fails. The tray shows:
 //   idle    ">_"   (prompt glyph)
 //   working  spinning ring (a rotated circle with a chunk missing)
+import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 import { TrayController } from "./controller";
-import { daemonAlive, stopDaemon } from "./ipc";
+import { daemonAlive, sendState, stopDaemon } from "./ipc";
 
 
 const DAEMON_SCRIPT = fileURLToPath(new URL("./daemon.ts", import.meta.url));
@@ -37,30 +39,60 @@ async function ensureDaemon(): Promise<boolean> {
     return false;
   }
   // Poll until the daemon claims its DBus name — fast when Bun boots quickly,
-  // resilient when startup is slow (a fixed sleep is neither).
-  for (let waited = 0; waited < 2000; waited += 100) {
-    if (await daemonAlive()) return true;
+  // resilient when startup is slow (a fixed sleep is neither). Wall-clock
+  // deadline + short probe timeout: gives up in ~2-3 s even when the bus
+  // connect itself hangs (each probe is capped at 300 ms).
+  const deadline = Date.now() + 2000;
+  while (Date.now() < deadline) {
+    if (await daemonAlive(300)) return true;
     await sleep(100);
   }
   return false;
 }
 
-// ponytail: last-resort synchronous kill on ANY exit path. session_shutdown
-// (graceful /quit, Ctrl+C, Ctrl+D) already calls stopDaemon() over DBus, but
-// SIGHUP (terminal closed) and SIGTERM (kill) skip session.dispose() entirely
-// via postmortem's process.exit(). This fires on all paths; the daemon's own
-// SIGTERM handler removes the SNI item cleanly. process.kill on an already-dead
-// PID throws ESRCH — swallowed.
-process.on("exit", () => {
-  if (daemonPid !== null) {
-    try { process.kill(daemonPid, "SIGTERM"); } catch {}
+// ponytail: last-resort synchronous kill on ANY exit path (session_shutdown,
+// SIGHUP terminal close, SIGTERM kill). PID-targeted with a /proc identity
+// check: PID reuse could signal an unrelated process, and an adopted daemon
+// (spawned by another omp) is never ours to kill. The daemon's SIGTERM
+// handler removes the SNI item cleanly. Linux-only check is fine — the
+// extension is Linux-only (SNI/DBus).
+function killOwnDaemon() {
+  if (daemonPid === null) return;
+  try {
+    // cmdline is NUL-separated argv — DAEMON_SCRIPT matches the path arg.
+    const cmdline = readFileSync(`/proc/${daemonPid}/cmdline`, "utf8");
+    if (cmdline.includes(DAEMON_SCRIPT)) process.kill(daemonPid, "SIGTERM");
+  } catch {
+    // Dead or foreign PID — nothing to signal.
   }
-});
+}
+process.on("exit", killOwnDaemon);
 
 export default function ompTray(pi: ExtensionAPI) {
   let daemonReady = false;
 
-  const controller = new TrayController(pi);
+  // Mid-turn recovery: a failed send means the daemon died or lost the shared
+  // slot. Respawn + reseed. NEVER awaited from inside the controller chain —
+  // reseed() enqueues onto TrayController.chain, so awaiting it from a chain
+  // job would deadlock the chain against itself. Single-flight: sends failing
+  // during recovery are superseded by the reseed() that follows.
+  let recovering = false;
+  function recover() {
+    if (recovering) return;
+    recovering = true;
+    void (async () => {
+      try {
+        daemonReady = await ensureDaemon();
+        if (daemonReady) await controller.reseed();
+      } finally {
+        recovering = false;
+      }
+    })();
+  }
+
+  const controller = new TrayController(pi, async (s) => {
+    if (!(await sendState(s))) recover();
+  });
   controller.attach();
 
   // Spawn the daemon at load time so the tray appears immediately — not on
@@ -115,7 +147,8 @@ export default function ompTray(pi: ExtensionAPI) {
         // Wait until the old daemon is actually gone before respawning: if
         // ensureDaemon() ran while daemonAlive() was still true, it would
         // adopt the dying daemon and never spawn a fresh one. Bounded ~2 s.
-        for (let waited = 0; waited < 2000 && (await daemonAlive()); waited += 100) {
+        const deadline = Date.now() + 2000;
+        while (Date.now() < deadline && (await daemonAlive(300))) {
           await sleep(100);
         }
         daemonReady = await ensureDaemon();
@@ -149,9 +182,11 @@ export default function ompTray(pi: ExtensionAPI) {
   });
 
   // session_shutdown fires on process exit (SIGINT/SIGTERM, /quit, /exit).
-  // The daemon is tied to the omp process lifetime: stop it so the tray
-  // icon is removed when omp closes.
+  // Signal only the daemon this process spawned (killOwnDaemon): with an
+  // adopted daemon — another omp spawned it — name-targeted stopDaemon()
+  // would stop that omp's tray. /tray stop|off|restart keep stopDaemon():
+  // an explicit user command targets the shared slot.
   pi.on("session_shutdown", async () => {
-    await stopDaemon();
+    killOwnDaemon();
   });
 }

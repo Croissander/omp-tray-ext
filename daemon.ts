@@ -1,10 +1,9 @@
-// omp tray daemon. Owns the DBus StatusNotifierItem. The omp extension
-// (index.ts) spawns this detached at load and stops it on quit via DBus
-// method calls on org.omptray.Daemon.
+// omp tray daemon. Owns the DBus StatusNotifierItem and the shared
+// org.omptray.Daemon control name — exactly one daemon per session bus
+// (slot losers exit cleanly). The omp extension (index.ts) spawns it
+// detached; /tray stop calls Stop over DBus, process teardown sends SIGTERM.
 //
 // States:  idle=">_",  working=spinning ring,  error="X"
-// The daemon's lifetime mirrors the omp process: spawned at startup,
-// removed on exit.
 
 import dbus from "dbus-next";
 import { DAEMON_IFACE, DAEMON_NAME, DAEMON_PATH, type DaemonState } from "./ipc";
@@ -14,6 +13,11 @@ const { interface: iface } = dbus;
 
 interface WatcherIface {
   RegisterStatusNotifierItem(service: string): Promise<void>;
+}
+
+/** Typed view over the DBus daemon driver (GetNameOwner + NameOwnerChanged). */
+interface DriverIface {
+  GetNameOwner(name: string): Promise<string>;
 }
 
 const SNI_IFACE = "org.kde.StatusNotifierItem";
@@ -118,6 +122,22 @@ DaemonControl.configureMembers({
 /** Handle for the spinner's setInterval timer. */
 type SpinnerHandle = NodeJS.Timeout;
 
+/** State → render mapping: the one place status/tooltip/attention are decided. */
+export function stateView(state: DaemonState, frame: number): {
+  px: Pixels;
+  status: "Active" | "NeedsAttention";
+  tooltip: string;
+  attention: boolean;
+} {
+  if (state === "working") {
+    return { px: spinnerFrameByIndex(frame), status: "Active", tooltip: "Working", attention: false };
+  }
+  if (state === "error") {
+    return { px: glyph("error"), status: "NeedsAttention", tooltip: "Error — agent stopped", attention: true };
+  }
+  return { px: glyph("prompt"), status: "Active", tooltip: "Idle", attention: false };
+}
+
 class Daemon {
   private bus: dbus.MessageBus | null = null;
   private item: OmpTrayItem | null = null;
@@ -142,25 +162,10 @@ class Daemon {
 
   private render() {
     if (!this.item) return;
-    let px: Pixels;
-    let status: string;
-    let tooltip: string;
-    if (this.state === "working") {
-      px = spinnerFrameByIndex(this.frame);
-      status = "Active";
-      tooltip = "Working";
-    } else if (this.state === "error") {
-      px = glyph("error");
-      status = "NeedsAttention";
-      tooltip = "Error — agent stopped";
-    } else {
-      px = glyph("prompt");
-      status = "Active";
-      tooltip = "Idle";
-    }
+    const { px, status, tooltip, attention } = stateView(this.state, this.frame);
     this.paint(px, tooltip);
     this.item.Status = status;
-    this.item.AttentionIconPixmap = this.state === "error" ? pixmapOf(px) : [];
+    this.item.AttentionIconPixmap = attention ? pixmapOf(px) : [];
     iface.Interface.emitPropertiesChanged(this.item, {
       Status: this.item.Status,
       AttentionIconPixmap: this.item.AttentionIconPixmap,
@@ -239,8 +244,47 @@ class Daemon {
     if (reply !== dbus.RequestNameReply.PRIMARY_OWNER) {
       console.error("[omptray-daemon] could not own SNI name, reply:", reply);
     }
-    // Also own the daemon control name so the extension can find us.
-    await bus.requestName(DAEMON_NAME, dbus.NameFlag.REPLACE_EXISTING).catch(() => {});
+    // Own the daemon control name — the shared slot for exactly one daemon.
+    // ALLOW_REPLACEMENT lets a later daemon take over the slot atomically
+    // instead of splitting SNI/control between two daemons. Losing the slot
+    // (queued behind a live owner, or replaced mid-request) = exit before
+    // registering with the watcher — no stale icon possible.
+    const controlReply = await bus
+      .requestName(DAEMON_NAME, dbus.NameFlag.REPLACE_EXISTING | dbus.NameFlag.ALLOW_REPLACEMENT)
+      .catch(() => 0);
+    if (controlReply !== dbus.RequestNameReply.PRIMARY_OWNER) {
+      console.error("[omptray-daemon] control name owned by another omp-tray daemon, exiting");
+      this.shutdown(0);
+      return false;
+    }
+
+    // Displacement watch: another daemon taking the control name means we
+    // lost the slot — exit after a short re-check so a displacer that dies
+    // immediately lets the original keep serving. We never steal the name
+    // back, so two daemons cannot ping-pong. A released name (newOwner "")
+    // is not displacement — keep serving. Best-effort: on any failure the
+    // startup ownership check above still covers the common race.
+    try {
+      const busName = "name" in bus && typeof bus.name === "string" ? bus.name : "";
+      const driver = (await bus.getProxyObject("org.freedesktop.DBus", "/org/freedesktop/DBus"))
+        .getInterface<DriverIface & dbus.ClientInterface>("org.freedesktop.DBus");
+      const DISPLACE_RECHECK_MS = 500;
+      driver.on("NameOwnerChanged", (name: string, _old: string, newOwner: string) => {
+        if (name !== DAEMON_NAME || newOwner === "" || newOwner === busName) return;
+        setTimeout(() => {
+          void (async () => {
+            let owner = "";
+            try { owner = await driver.GetNameOwner(DAEMON_NAME); } catch {}
+            if (owner !== busName) {
+              console.error("[omptray-daemon] displaced by another omp-tray daemon, exiting");
+              this.shutdown(0);
+            }
+          })();
+        }, DISPLACE_RECHECK_MS);
+      });
+    } catch {
+      // Watch unavailable — startup check alone still covers the common race.
+    }
 
     try {
       const watcherProxy = await bus.getProxyObject("org.kde.StatusNotifierWatcher", "/StatusNotifierWatcher");
@@ -286,15 +330,15 @@ class Daemon {
   }
 }
 
-const daemon = new Daemon();
-
-// Graceful signals: release the name so the panel removes the icon promptly.
-const die = () => daemon.shutdown();
-for (const sig of ["SIGTERM", "SIGINT", "SIGHUP"] as const) {
-  process.on(sig, die);
-}
-
+// Module import is side-effect-free (tests import stateView); daemon
+// instantiation and signal wiring happen only when run as the daemon.
 if (import.meta.main) {
+  const daemon = new Daemon();
+  // Graceful signals: release the name so the panel removes the icon promptly.
+  const die = () => daemon.shutdown();
+  for (const sig of ["SIGTERM", "SIGINT", "SIGHUP"] as const) {
+    process.on(sig, die);
+  }
   const ok = await daemon.start();
   if (!ok) process.exit(1);
   // Keep the event loop alive for DBus I/O + the spinner timer.
