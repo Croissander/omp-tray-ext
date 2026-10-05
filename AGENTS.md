@@ -64,10 +64,14 @@ validates the state literal (trust boundary), then emits SNI properties
   "idle" leaves the tray spinning forever. The chain forces call B to wait for
   call A's `sendState` to resolve; it `.catch()`es so a failing send can't
   wedge every later state.
-- **One daemon per session bus (shared slot).** The control name is claimed
-  with `REPLACE_EXISTING | ALLOW_REPLACEMENT`; a non-`PRIMARY_OWNER` reply
-  exits before watcher registration, and a later displacement (re-checked
-  after 500 ms) exits the loser — never steal the name back (no ping-pong).
+- **One daemon per session bus (exclusive slot).** The control name is
+  claimed with `DO_NOT_QUEUE` — exclusive, first live claimant wins: any
+  later daemon's claim gets `EXISTS` and exits BEFORE registering any
+  StatusNotifierItem, so at most one tray icon exists even when several
+  daemons start concurrently (e.g. omp loads the extension twice). A name
+  can't be replaced out from under a live owner, so a new daemon claims the
+  slot only after the previous one exits; deliberate takeover is
+  `/tray restart` (stop + respawn).
   Process teardown (`session_shutdown` + `process.on("exit")`) signals only a
   daemon this process spawned: `killOwnDaemon()` verifies identity via
   `/proc/<pid>/cmdline` before SIGTERM (PID-reuse guard). The daemon's
@@ -120,6 +124,7 @@ restart omp to re-iterate):
 ```bash
 ln -s "$PWD" ~/.omp/agent/extensions/omp-tray-ext   # Option A: user extension
 omp --extension ./.                                  # Option B: one-shot load
+# ⚠️ Use only ONE load channel: a ~/.omp/agent/extensions symlink PLUS an `omp install` copy loads the extension twice in one omp session (duplicate event handlers, redundant daemon spawn per open).
 ```
 
 `daemonReady` is re-checked on `session_start`, so `/compact` or a session
@@ -217,7 +222,7 @@ Authoritative: <https://omp.sh/docs/extension-authoring>,
 | `index.test.ts` | Spawn-runner resolution suite (fork-bomb pin, bun:test) |
 | `controller.test.ts` | Chain-ordering/state-machine suite (bun:test) |
 | `icons.test.ts` | Pixel/ARGB correctness suite (bun:test) |
-| `daemon.test.ts` | `stateView` render-mapping suite (bun:test) |
+| `daemon.test.ts` | `stateView` render-mapping suite + single-instance slot pin (bun:test) |
 | `.github/workflows/ci.yml` | CI: `bun install --frozen-lockfile` + gates on push/PR |
 | `package.json` | `omp.extensions` load hook; `name` doubles as `disabledExtensions` key; `version` couples to git tag |
 | `tsconfig.json` | Strict flags — see Runtime/Tooling Preferences |
@@ -262,9 +267,17 @@ Authoritative: <https://omp.sh/docs/extension-authoring>,
   pre-rendered glyph instances.
 - `daemon.test.ts` pins the render mapping (`stateView`): exact
   status/tooltip/attention literals per state and shared pre-rendered glyph
-  instances (`===` identity); importing `daemon.ts` is side-effect-free.
+  instances (`===` identity); importing `daemon.ts` is side-effect-free. It
+  also pins the single-instance slot: a second concurrent daemon gets
+  `EXISTS`, exits before SNI registration, leaving exactly one registration
+  and one surviving process. This slot test is the one deliberate deviation
+  from "tests never touch DBus": it runs against a PRIVATE throwaway
+  `dbus-daemon` session bus with a fake StatusNotifierWatcher (hermetic —
+  never the real session bus) and self-skips when the `dbus-daemon` binary is
+  missing.
 - Patterns to reuse: `stubApi()` double (tests never touch DBus — inject
-  `send`), `drain()` macrotask yield that settles the chain regardless of
+  `send`; sole exception is the hermetic slot test above), `drain()`
+  macrotask yield that settles the chain regardless of
   microtask hop count, `void c["transition"](...)` to fire internals the way
   omp does (un-awaited handlers), real-timer waits through the `errorMs` seam
   (`new TrayController(api, send, 10)`).

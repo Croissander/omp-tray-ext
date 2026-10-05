@@ -15,11 +15,6 @@ interface WatcherIface {
   RegisterStatusNotifierItem(service: string): Promise<void>;
 }
 
-/** Typed view over the DBus daemon driver (GetNameOwner + NameOwnerChanged). */
-interface DriverIface {
-  GetNameOwner(name: string): Promise<string>;
-}
-
 const SNI_IFACE = "org.kde.StatusNotifierItem";
 const SNI_PATH = "/StatusNotifierItem";
 const SNI_NAME = "org.kde.StatusNotifierItem.omptray";
@@ -244,46 +239,20 @@ class Daemon {
     if (reply !== dbus.RequestNameReply.PRIMARY_OWNER) {
       console.error("[omptray-daemon] could not own SNI name, reply:", reply);
     }
-    // Own the daemon control name — the shared slot for exactly one daemon.
-    // ALLOW_REPLACEMENT lets a later daemon take over the slot atomically
-    // instead of splitting SNI/control between two daemons. Losing the slot
-    // (queued behind a live owner, or replaced mid-request) = exit before
-    // registering with the watcher — no stale icon possible.
+    // Own the daemon control name — the exclusive slot for exactly one daemon.
+    // DO_NOT_QUEUE, no replacement: a second daemon's claim gets EXISTS and
+    // exits before registering with the watcher — at most one tray icon even
+    // when several daemons start concurrently. (REPLACE_EXISTING + a
+    // displacement watch shipped two icons on 2026-10-05: the replace let both
+    // claimants pass the gate, and the watch's subscription raced the
+    // takeover.) Deliberate takeover is /tray restart (stop + respawn).
     const controlReply = await bus
-      .requestName(DAEMON_NAME, dbus.NameFlag.REPLACE_EXISTING | dbus.NameFlag.ALLOW_REPLACEMENT)
+      .requestName(DAEMON_NAME, dbus.NameFlag.DO_NOT_QUEUE)
       .catch(() => 0);
     if (controlReply !== dbus.RequestNameReply.PRIMARY_OWNER) {
       console.error("[omptray-daemon] control name owned by another omp-tray daemon, exiting");
       this.shutdown(0);
       return false;
-    }
-
-    // Displacement watch: another daemon taking the control name means we
-    // lost the slot — exit after a short re-check so a displacer that dies
-    // immediately lets the original keep serving. We never steal the name
-    // back, so two daemons cannot ping-pong. A released name (newOwner "")
-    // is not displacement — keep serving. Best-effort: on any failure the
-    // startup ownership check above still covers the common race.
-    try {
-      const busName = "name" in bus && typeof bus.name === "string" ? bus.name : "";
-      const driver = (await bus.getProxyObject("org.freedesktop.DBus", "/org/freedesktop/DBus"))
-        .getInterface<DriverIface & dbus.ClientInterface>("org.freedesktop.DBus");
-      const DISPLACE_RECHECK_MS = 500;
-      driver.on("NameOwnerChanged", (name: string, _old: string, newOwner: string) => {
-        if (name !== DAEMON_NAME || newOwner === "" || newOwner === busName) return;
-        setTimeout(() => {
-          void (async () => {
-            let owner = "";
-            try { owner = await driver.GetNameOwner(DAEMON_NAME); } catch {}
-            if (owner !== busName) {
-              console.error("[omptray-daemon] displaced by another omp-tray daemon, exiting");
-              this.shutdown(0);
-            }
-          })();
-        }, DISPLACE_RECHECK_MS);
-      });
-    } catch {
-      // Watch unavailable — startup check alone still covers the common race.
     }
 
     try {
