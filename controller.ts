@@ -19,17 +19,31 @@ function messageRole(message: unknown): string | undefined {
 
 /**
  * Mapping (the daemon renders: idle=">_", working=spinner, error="X"):
- *  - agent_end → idle (turn_end ignored; it fires mid-loop)
- *  - agent_start / tool_execution_start → working
- *  - before_provider_request / assistant message_start → working
- *  - tool_result(isError) → error (transient; reverts to the pre-error
- *    state after errorMs)
+ *  - agent_start → working; agent_end(willContinue falsy) → idle
+ *  - assistant message_start / tool_execution_start / tool_result → working,
+ *    only inside the agent_start..terminal agent_end window (`inRun`)
+ *  - tool_result(isError) → error anywhere (transient; reverts to the
+ *    pre-error state after errorMs)
+ *  - session_before_switch / session_switch / session_shutdown → idle
+ *    (a mid-turn switch swallows agent_end; these are the only idle signal)
  *  - (shutdown handled by index.ts: stops the daemon on quit)
+ *
+ * before_provider_request is deliberately UNMAPPED and must NEVER be
+ * re-added: prompt-cache idle warming replays provider calls while idle with
+ * no run around them, so mapping it flips the tray to working with no
+ * agent_end to settle it back — the stuck-working bug this gating exists to
+ * prevent. In-run it would be redundant anyway (agent_start / assistant
+ * message_start / tool_execution_start already cover every run).
  */
 export class TrayController {
   private current: DaemonState = "idle";
   private revertTo: DaemonState = "idle";
   private errorClearTimer: TimerHandle | null = null;
+  // True between agent_start and its terminal agent_end. Working-mapped
+  // events are only trusted inside this window: some sources fire with no
+  // agent_end to settle them back (non-loop tool_result from standalone tool
+  // dispatches, idle cache-warm provider replays) and would strand "working".
+  private inRun = false;
   // ponytail: serializes state changes so the daemon sees them in the same
   // order the extension emits them. Each sendState opens its own DBus
   // connection (ipc.connectBus) with no cross-connection FIFO, so two
@@ -135,32 +149,66 @@ export class TrayController {
 
   attach() {
     this.pi.on("agent_start", async () => {
+      this.inRun = true;
       await this.transition("working");
     });
 
-    this.pi.on("before_provider_request", async () => {
-      await this.transition("working");
-    });
-
+    // Working-mapped handlers below are gated on `inRun`: the unbracketed
+    // sources (non-loop tool_result from standalone tool dispatches, idle
+    // cache-warm provider replays) fire outside any run, and a "working"
+    // send from them has no agent_end to settle it back — stuck spinner.
     this.pi.on("message_start", async (event) => {
+      if (!this.inRun) return;
       if (messageRole(event.message) === "assistant") {
         await this.transition("working");
       }
     });
 
     this.pi.on("tool_execution_start", async () => {
+      if (!this.inRun) return;
       await this.transition("working");
     });
 
     this.pi.on("tool_result", async (event) => {
+      // Errors flash UNGATED (self-healing: the flash reverts after errorMs):
+      // a background tool failure must still surface even outside a run.
       if (event.isError) {
         this.flashError();
         return;
       }
+      if (!this.inRun) return;
       await this.transition("working");
     });
 
-    this.pi.on("agent_end", async () => {
+    this.pi.on("agent_end", async (event) => {
+      // A truthy willContinue means a continuation is already scheduled
+      // (incl. awaitingAsyncWork waits): not a user-visible terminal, so
+      // keep the window open and send nothing — the continuation's
+      // agent_start continues the same visible run. If that continuation is
+      // aborted, its terminal agent_end closes the window normally.
+      if (event.willContinue) return;
+      this.inRun = false;
+      await this.transition("idle");
+    });
+
+    // Mid-turn session switches disconnect listeners before the abort, so
+    // agent_end never arrives — the transition is the window's only idle
+    // close. Bound on both names: session_before_switch is the earliest
+    // bindable signal, session_switch covers hosts that skip the before-hook.
+    this.pi.on("session_before_switch", async () => {
+      this.inRun = false;
+      await this.transition("idle");
+    });
+    this.pi.on("session_switch", async () => {
+      this.inRun = false;
+      await this.transition("idle");
+    });
+
+    // Fires on ANY session dispose (subagent child sessions included): a
+    // child's dispose happens before its abort swallows agent_end, so this
+    // resets a working stranded by a child run.
+    this.pi.on("session_shutdown", async () => {
+      this.inRun = false;
       await this.transition("idle");
     });
   }

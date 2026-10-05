@@ -25,12 +25,14 @@ omp process (transient)          tray daemon (one per session bus)
 
 - `index.ts` — extension entry (`export default function ompTray(pi)`); daemon
   lifetime (detached `Bun.spawn`, single-flight `ensureDaemon`, `recover()` on
-  failed sends), owner of `session_start` / `session_switch` /
-  `session_shutdown`, `/tray` command, exit-registered PID-checked kill
-  (`killOwnDaemon`).
-- `controller.ts` — `TrayController`: maps omp turn events to `DaemonState`
-  (`"idle" | "working" | "error"`) and serializes sends on a promise chain
-  (error-flash timing lives here too).
+  failed sends with an unconditional reseed), owner of the `session_start` /
+  `session_switch` re-ensure handlers (`session_shutdown` is mapped in
+  `controller.ts` only — index.ts never binds it), `/tray` command,
+  exit-registered PID-checked kill (`killOwnDaemon` — the only kill path).
+- `controller.ts` — `TrayController`: maps omp events to `DaemonState`
+  (`"idle" | "working" | "error"`) under a turn window (`inRun`), closes the
+  window on terminal `agent_end` and on session transitions, and serializes
+  sends on a promise chain (error-flash timing lives here too).
 - `ipc.ts` — shared DBus contract (bus name `org.omptray.Daemon`, path/iface
   `/org/omptray/Daemon`) + deadline-bounded client `daemonAlive(timeoutMs?)`,
   `sendState` (resolves `false` on failure), `stopDaemon(timeoutMs?)` (true
@@ -47,14 +49,26 @@ omp process (transient)          tray daemon (one per session bus)
 - `icons.ts` — pure 22×22 pixel glyphs (no font/image library): `>_` prompt,
   `X` error, 8 spinner frames; RGBA→ARGB converter.
 
-Exact flow: turn events (`agent_start`, `before_provider_request`,
-`tool_execution_start`, assistant `message_start`) → `working`; `tool_result`
-with `isError` → `error` flash (else `working`); `agent_end` → `idle` (no
-`turn_end` handler — deliberate; it fires mid-loop). `index.ts` handles
-`session_start` (`ensureDaemon()` then `controller.force("idle")`),
-`session_switch` (re-`ensureDaemon()` only — switching sessions is not an
-idle signal), and `session_shutdown` (`killOwnDaemon()` — PID-targeted, never
-another omp's daemon). Sends call `SetState`; the daemon validates the state
+Exact flow: event mapping is TURN-WINDOWED — `agent_start` opens the run
+window, and working-mapped events (assistant `message_start`,
+`tool_execution_start`, `tool_result` success) apply ONLY inside it; while
+idle they are IGNORED (omp emits unpaired idle-time events: prompt-cache warm
+replays fire provider requests on an idle timer for up to 30 min; non-loop
+tool dispatches emit `tool_result` with no run around them — a "working" from
+either has no `agent_end` to settle it back). `before_provider_request` is NO
+LONGER MAPPED and must NEVER be re-added. `tool_result` with `isError` →
+`error` flash even while idle (self-reverting). `agent_end` → `idle` only when
+`willContinue` is falsy (continuations, incl. `awaitingAsyncWork`, are not
+user-visible terminals — the window stays open); no `turn_end` handler —
+deliberate, it fires mid-loop. `session_before_switch` / `session_switch` /
+`session_shutdown` close the window + `idle` (a mid-turn switch swallows
+`agent_end`; subagent child disposals emit `session_shutdown`). `index.ts`
+handles `session_start` (`ensureDaemon()` then `controller.force("idle")`)
+and `session_switch` (re-`ensureDaemon()` only — switching sessions is not an
+idle signal); teardown is the exit-registered `killOwnDaemon()` (PID-targeted
+with a `/proc/<pid>/cmdline` identity check — never another omp's daemon) plus
+the explicit `/tray stop` — `session_shutdown` never stops the daemon. Sends
+call `SetState`; the daemon validates the state
 literal (trust boundary), then publishes SNI properties (`IconPixmap`,
 `ToolTip`, `Status`, `AttentionIconPixmap`) and emits `NewIcon`,
 `NewAttentionIcon`, `NewStatus` (WITH the `(s)` status string), `NewTitle`,
@@ -64,12 +78,31 @@ TEXT changes (spinner ticks must not churn it).
 
 | Agent state | Icon | SNI `Status` | Trigger |
 |---|---|---|---|
-| idle | `>_` | `Active` | `session_start` (via `force`) / `agent_end` |
-| working | spinning ring (8 frames, ~8 fps) | `Active` | turn events (see above) |
+| idle | `>_` | `Active` | `session_start` (via `force`) / terminal `agent_end` (`willContinue` falsy) / session switch/shutdown |
+| working | spinning ring (8 frames, ~8 fps) | `Active` | in-run turn events (see above) |
 | error | `X` | `NeedsAttention` | `tool_result` with `isError`; auto-clears `errorMs` (5 s) after the error **send**, back to the **pre-error** state |
 
 ### Key invariants (do not break)
 
+- **Event mapping is TURN-WINDOWED (`inRun` opens at `agent_start`).**
+  Working-mapped events (assistant `message_start`, `tool_execution_start`,
+  `tool_result` success) apply ONLY inside the window; while idle they are
+  ignored — omp emits unpaired idle-time events (prompt-cache warm replays
+  fire provider requests on an idle timer for up to 30 min; non-loop tool
+  dispatches emit `tool_result` with no run around them), and a "working" from
+  them has no `agent_end` to settle it back (the stuck-working bug this gate
+  exists to prevent). `before_provider_request` is UNMAPPED and must NEVER be
+  re-added: it is the only mapped event reachable from unbracketed provider
+  calls, and in-run it is redundant (`agent_start` / `message_start` /
+  `tool_execution_start` already cover every run). `tool_result` `isError`
+  flashes ERROR even while idle (self-reverting). `agent_end` is terminal only
+  when `willContinue` is falsy — continuations (incl. `awaitingAsyncWork`)
+  keep the window open (such settles are not user-visible terminals).
+  `session_before_switch` / `session_switch` / `session_shutdown` close the
+  window + idle: a mid-turn switch swallows `agent_end` (listeners disconnect
+  before the abort), so these are the window's only idle close, and
+  `session_shutdown` also fires for subagent child disposals — resetting a
+  working stranded by a child run.
 - **State transitions serialize through `TrayController.chain`.** Each
   `sendState` opens its own DBus connection with no cross-connection FIFO, so
   concurrent transitions can reorder — a stale "working" landing after a later
@@ -88,25 +121,27 @@ TEXT changes (spinner ticks must not churn it).
   from under a live owner, so a new daemon claims the slot only after the
   previous one exits; deliberate takeover is `/tray restart` (stop + respawn,
   fails honestly — never adopts a daemon still alive at the wait deadline).
-  Process teardown (`session_shutdown` + `process.on("exit")`) signals only a
-  daemon this process spawned: `killOwnDaemon()` verifies identity via
-  `/proc/<pid>/cmdline` before SIGTERM (PID-reuse guard). The daemon's
+  Process teardown is the exit-registered `process.on("exit", killOwnDaemon)`
+  plus the explicit `/tray stop` — NEVER a `session_shutdown` handler (the
+  event fires for subagent child disposals too, sharing the module-level
+  `daemonPid`, so a child's dispose would kill the shared daemon mid-parent-
+  turn). `killOwnDaemon()` signals only a daemon this process spawned: it
+  verifies identity via `/proc/<pid>/cmdline` before SIGTERM (PID-reuse
+  guard). The daemon's
   SIGTERM handler removes the SNI item cleanly. `process.kill`/
   `bus.disconnect` on a dead target throws ESRCH — swallowed in `try/catch`.
-- **`ensureDaemon` is single-flight; the generation guard covers double-load
-  AND reload.** Overlapping callers (load-time ensure, `session_start` /
+- **`ensureDaemon` is single-flight; there is deliberately NO generation
+  guard (the v1.3.0 `globalThis` generation guard is removed — never
+  re-add).** Overlapping callers (load-time ensure, `session_start` /
   `session_switch` handlers, `recover()`, `/tray restart`) share one spawn
   attempt — `daemonPid` is last-write-wins, and a stomped PID would name a
   dead slot-loser while the surviving daemon is never killed at exit
-  (orphaned icon). The `Symbol.for("omp-tray-ext.gen")` counter on
-  `globalThis` collapses double-loaded copies (two path spellings → two
-  module scopes in one process) to one live handler set — the newest
-  activation wins — and makes module reloads (fresh `?mtime` import) replace
-  the previous activation cleanly: every event handler, the `/tray` handler
-  and the send wrapper start with a `stale()` check and no-op silently. NEVER
-  guard `process.on("exit", killOwnDaemon)` — a stale activation must still
-  reap its own spawn (the kill is PID-targeted with a `/proc` identity
-  check).
+  (orphaned icon). omp re-binds extension factories in-process per subagent
+  session WITHOUT re-evaluating the module, so a generation counter silences
+  the parent's handlers and drops queued sends the moment any subagent has run
+  — dropping the final "idle" strands the icon at "working". Double-load
+  duplicates without the guard are benign: same events → identical sends, and
+  the daemon's `SetState` is idempotent.
 - **Watcher (re-)registration is subscribe-before-act and fires on every
   owner appearance.** The daemon (re-)registers with
   `org.kde.StatusNotifierWatcher` on EVERY appearance of the watcher name —
@@ -162,7 +197,12 @@ TEXT changes (spinner ticks must not churn it).
   `reseed()`) — single-flight, its flag cleared BEFORE the reseed (so a failed
   reseed's nested `recover()` can start a new attempt) and NEVER awaited from
   inside `TrayController.chain` (reseed enqueues on the chain; awaiting it
-  from a chain job deadlocks the chain against itself).
+  from a chain job deadlocks the chain against itself). The reseed is
+  UNCONDITIONAL — even when the respawn failed: a failed ensure is not final
+  (the daemon may appear moments later), and the forced reseed retries the
+  lost final "idle" that the dedupe would otherwise swallow.
+- **Known ceiling:** a SIGKILLed omp cannot signal the daemon — a "working"
+  from the killed session can linger until another omp writes state.
 
 ### Slash-command surface (`/tray`)
 
@@ -190,7 +230,7 @@ Flat root — no `src/`; all source, tests, and config live beside each other:
 ```bash
 bun install                       # one-time; dbus-next only
 bunx tsc --noEmit                 # typecheck (strict) — after every change
-bun test                          # full suite (5 files)
+bun test                          # full suite (5 files, 48 tests)
 bun test controller.test.ts       # single file (each header states its command)
 bun ./icons.ts                    # render glyphs, print pixel counts (visual check)
 ```
@@ -296,13 +336,13 @@ Authoritative: <https://omp.sh/docs/extension-authoring>,
 
 | Path | Role |
 |---|---|
-| `index.ts` | Extension entry (`ompTray` factory), daemon lifetime (single-flight `ensureDaemon`, generation guard), `/tray` |
+| `index.ts` | Extension entry (`ompTray` factory), daemon lifetime (single-flight `ensureDaemon`, unconditional-reseed `recover()`, exit-hook PID-checked kill), `/tray` |
 | `daemon.ts` | Detached SNI daemon: `Daemon`, `DaemonControl`, `stateView`, `/MenuBar` dbusmenu, `import.meta.main` entry |
-| `controller.ts` | `TrayController` — event→state mapping + serialized chain (flash timing) |
+| `controller.ts` | `TrayController` — turn-windowed event→state mapping + serialized chain (flash timing) |
 | `ipc.ts` | DBus contract constants + deadline-bounded client (`daemonAlive`/`sendState`/`stopDaemon`, `deadline()`, `__setSessionBusForTests`) |
 | `icons.ts` | Glyph drawing + ARGB conversion; `import.meta.main` visual demo |
-| `index.test.ts` | Spawn-runner resolution + extension pins (single-flight spawn, generation guard, restart failure; bun:test) |
-| `controller.test.ts` | Chain-ordering/state-machine + flash-timing pins (bun:test) |
+| `index.test.ts` | Spawn-runner resolution + extension pins (single-flight spawn, reseed-after-failed-ensure, no-suppression, shutdown-no-kill, restart failure; bun:test) |
+| `controller.test.ts` | Chain-ordering/state-machine + turn-window mapping + flash-timing pins (bun:test) |
 | `icons.test.ts` | Pixel/ARGB correctness suite (bun:test) |
 | `daemon.test.ts` | `stateView` render-mapping + hermetic lifecycle pins (slot, watcher-restart, SNI conformance, initial-state, SIGTERM-during-startup; bun:test) |
 | `ipc.test.ts` | `deadline` unit pins + fake-bus RPC pins (never-settle, success, disconnect-always; bun:test) |
@@ -337,20 +377,27 @@ Authoritative: <https://omp.sh/docs/extension-authoring>,
 ## Testing & QA
 
 - Framework: **bun:test** (`import { test, expect } from "bun:test"`), flat
-  `*.test.ts` beside sources. Full suite `bun test`; each file's header
-  comment states its single-file command.
+  `*.test.ts` beside sources. Full suite `bun test` (48 tests / 5 files);
+  each file's header comment states its single-file command.
 - `index.test.ts` pins the spawn runner and extension lifetime:
   `resolveDaemonRunner` prefers `bun` from PATH and returns `null` for a
   non-bun host binary (fork-bomb pin); overlapping `ensureDaemon()` calls
-  share one spawn (single-flight pin); a stale activation is silent while the
-  newest sends (generation pin); `/tray restart` failure spawns and adopts
-  nothing (restart-failure pin).
+  share one spawn (single-flight pin); a lost final idle is retried even
+  after a failed respawn (reseed-after-failed-ensure pin); no activation is
+  suppressed — both send (no-suppression pin); `session_shutdown` settles the
+  icon and never kills the daemon (shutdown-no-kill pin); `/tray restart`
+  failure spawns and adopts nothing (restart-failure pin).
 - `controller.test.ts` pins the ordering + timing invariants: FIFO chain under
   send reordering, error flash can't overtake a later idle, `force` bypasses
   the dedupe, `reseed` replays state after a daemon respawn AND reads it at
   job execution (not call time), flash dedupe, revert to the **pre-error**
   state after `errorMs`, `errorMs` measured from the error **send** (not the
   call), and a flash/transition/flash burst reverts to the pre-flash state.
+  Its turn-window mapping pins: cache-warm idle replays can't reopen working
+  (no `before_provider_request`), non-loop idle `tool_result` (success
+  ignored, error still flashes), `willContinue` `agent_end` keeps the window
+  open, and session switch/shutdown close a window that never got its
+  `agent_end`.
 - `icons.test.ts` pins pixel correctness: `[a,r,g,b]` byte order, visible
   glyphs/frames, pairwise-distinct spinner frames, 8-frame wraparound, shared
   pre-rendered glyph instances.

@@ -21,9 +21,26 @@ and pushed as `IconPixmap` ARGB data over DBus.
 
 | Agent state | Tray icon | SNI `Status` | Fires on |
 |-------------|-----------|--------------|----------|
-| idle | `>_` prompt glyph | `Active` | `session_start` / `agent_end` |
-| working | spinning ring (rotated circle, chunk missing; monochrome) | `Active` | `agent_start` / `before_provider_request` / `message_start` (assistant) / `tool_execution_start` / `tool_result` (success) |
-| error | `X` crossed strokes | `NeedsAttention` | `tool_result` with `isError` (auto-clears after 5 s, reverting to the pre-error `working`/`idle` state) |
+| idle | `>_` prompt glyph | `Active` | `session_start` / terminal `agent_end` / `session_before_switch` / `session_switch` / `session_shutdown` |
+| working | spinning ring (rotated circle, chunk missing; monochrome) | `Active` | `agent_start`, and inside the run window only: assistant `message_start` / `tool_execution_start` / `tool_result` (success) |
+| error | `X` crossed strokes | `NeedsAttention` | `tool_result` with `isError` — any time, even outside a run (auto-clears after 5 s, reverting to the pre-error state) |
+
+Mapping is **turn-windowed**: a run window opens at `agent_start` and closes at
+a terminal `agent_end` (`willContinue` falsy — a continuation, including an
+`awaitingAsyncWork` wait, keeps the window open, so there is no false idle
+between steps of one visible run). Working-mapped events are ignored outside
+the window: omp emits unpaired events while idle — prompt-cache warm replays
+(provider requests with no run around them) and standalone tool dispatches —
+and mapping those used to strand the spinner with no `agent_end` to settle it
+back. For the same reason `before_provider_request` is deliberately unmapped
+and must not be re-added: cache warming fires it on an idle timer (up to 30
+minutes) with no run around it.
+
+**The guarantee this buys: the tray returns to idle when the agent finishes.**
+Idle-time provider traffic (prompt-cache warming) and background tool results
+cannot strand the spinner. Background failures still surface: a `tool_result`
+with `isError` flashes the error glyph even while idle, then self-reverts to
+the pre-error state.
 
 The spinner animates at ~8 fps while the agent is working — each frame is a
 ring with a ~90° arc gap, rotated 45° per frame.
@@ -58,13 +75,18 @@ cwd           : /home/you/project
 ## Architecture
 
 A **detached daemon** owns the tray; the omp extension spawns it at load and
-signals it on quit, forwarding state over DBus IPC. One daemon serves every
-omp on the session bus (single shared icon, last writer wins); process
-teardown stops only the daemon that instance spawned. A daemon dying
-mid-turn is respawned on the next state event. The icon survives panel and
-DE restarts: the daemon watches the StatusNotifierWatcher and re-registers
-whenever one appears, so the tray also shows up when the daemon starts
-before the panel does.
+shuts it down at process exit, forwarding state over DBus IPC. One daemon
+serves every omp on the session bus (single shared icon, last writer wins),
+and teardown stops only the daemon that instance spawned. What teardown is
+*not*: `session_shutdown` never stops the daemon (it also fires when subagent
+child sessions are disposed) — it only closes the run window and sends idle.
+Process exit (quit, SIGINT/SIGTERM, terminal close) does the stopping, via
+`process.on("exit")` with a PID + `/proc` cmdline identity check so a recycled
+PID is never signaled. `/tray stop` remains the explicit stop. A daemon dying
+mid-turn is respawned (and its state reseeded) on the next state event. The
+icon survives panel and DE restarts: the daemon watches the
+StatusNotifierWatcher and re-registers whenever one appears, so the tray also
+shows up when the daemon starts before the panel does.
 
 ```
 omp process (transient)          tray daemon (tied to omp lifetime)
@@ -79,16 +101,21 @@ omp process (transient)          tray daemon (tied to omp lifetime)
 ```
 
 - `index.ts` — extension entry; owns `session_start` (`ensureDaemon()` then
-  `controller.force("idle")`) and `session_switch` (re-ensure), spawns the
-  daemon detached, forwards turn events, respawns + reseeds on a failed send,
-  registers the `/tray` command.
+  `controller.force("idle")`) and `session_switch` (re-ensure only), spawns
+  the daemon detached, forwards turn events, respawns + reseeds on a failed
+  send (the reseed runs even when the respawn fails — the daemon may appear
+  moments later, and the forced reseed retries the lost final idle),
+  registers the `/tray` command, and kills the spawned daemon at process exit.
 - `daemon.ts` — owns the SNI item + `org.omptray.Daemon` control interface
   (exclusive name slot — a competing daemon exits cleanly, no name stealing);
   re-registers with a (re)appearing StatusNotifierWatcher; renders the
   spinner and responds to `SetState`/`Stop`.
 - `ipc.ts` — shared DBus client: `daemonAlive`, `sendState`, `stopDaemon`.
-- `controller.ts` — maps omp turn events to `idle`/`working`/`error`;
-  `attach()` maps turn events only — `session_start` is owned by `index.ts`.
+- `controller.ts` — maps omp events to `idle`/`working`/`error`, turn-windowed
+  (see States); `attach()` maps run and session-lifecycle events (when a
+  mid-turn switch swallows `agent_end`, `session_before_switch`/
+  `session_switch`/`session_shutdown` are the run window's only idle close) —
+  `session_start` is owned by `index.ts`.
 - `icons.ts` — monochrome glyphs: `>` chevron + `_`, `X` (crossed strokes), 8 spinner frames.
 
 ## Install
@@ -129,7 +156,7 @@ omp --extension ./omp-tray-ext
 **Option D — install via the `omp` CLI (pinned to a release tag):**
 
 ```bash
-omp install github:Croissander/omp-tray-ext#v1.3.0
+omp install github:Croissander/omp-tray-ext#v1.3.1
 ```
 
 Always install with a `#vX.Y.Z` tag (or `#master`) — a bare `git@...` spec gets
@@ -146,7 +173,7 @@ imports the TypeScript directly via Bun.
 ```bash
 bun install          # one-time; dbus-next only
 bunx tsc --noEmit    # typecheck (strict)
-bun test             # full suite (5 files: index + controller + icons + daemon + ipc)
+bun test             # full suite (5 files / 48 tests)
 bun test index.test.ts
 bun test controller.test.ts
 bun test icons.test.ts

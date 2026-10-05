@@ -94,8 +94,8 @@ async function ensureDaemonAttempt(): Promise<boolean> {
   return false;
 }
 
-// ponytail: last-resort synchronous kill on ANY exit path (session_shutdown,
-// SIGHUP terminal close, SIGTERM kill). PID-targeted with a /proc identity
+// ponytail: last-resort synchronous kill on the process-exit path (quit,
+// SIGINT/SIGTERM, SIGHUP terminal close). PID-targeted with a /proc identity
 // check: PID reuse could signal an unrelated process, and an adopted daemon
 // (spawned by another omp) is never ours to kill. The daemon's SIGTERM
 // handler removes the SNI item cleanly. Linux-only check is fine — the
@@ -112,24 +112,14 @@ function killOwnDaemon() {
 }
 process.on("exit", killOwnDaemon);
 
-// Generation counter shared across module scopes — see the guard note in
-// ompTray. `as unknown as` mirror of globalThis, same trick as ipc.test.ts.
-const GEN = Symbol.for("omp-tray-ext.gen");
-const gens = globalThis as unknown as { [key: symbol]: number | undefined };
-
 export default function ompTray(pi: ExtensionAPI) {
-  // Generation guard for double-load AND reload: extension modules
-  // RE-EVALUATE on every load (fresh ?mtime import tag) while globalThis
-  // persists, and the same extension can load twice in one process (two path
-  // spellings → two module scopes sharing one process). Each activation bumps
-  // the shared counter; every handler body it registers starts with the
-  // stale() check and NO-OPS silently once a newer activation has taken over —
-  // double-load collapses to one live handler set (newest wins) and a reload
-  // replaces the previous activation cleanly. Deliberately NOT stale-guarded:
-  // process.on("exit", killOwnDaemon) — a stale activation must still reap
-  // its own spawn (the kill is PID-targeted with a /proc identity check).
-  const gen = (gens[GEN] = (gens[GEN] ?? 0) + 1);
-  const stale = () => gens[GEN] !== gen;
+  // Deliberately NO globalThis generation/staleness guard (the v1.3.0 one is
+  // removed): omp re-binds extension factories in-process per subagent
+  // (child) session WITHOUT re-evaluating the module, so a generation counter
+  // silences the parent's handlers and drops queued sends the moment any
+  // subagent has run — dropping the final "idle" strands the icon at
+  // "working". Double-load duplicates without the guard are benign: same
+  // events → identical sends, and the daemon's SetState is idempotent.
 
   // Mid-turn recovery: a failed send means the daemon died or lost the shared
   // slot. Respawn + reseed. NEVER awaited from inside the controller chain —
@@ -151,14 +141,16 @@ export default function ompTray(pi: ExtensionAPI) {
         // and left nothing to retry once the flag dropped.
         recovering = false;
       }
-      if (ok) await controller.reseed();
+      // Reseed even when the ensure failed (daemonReady = ok): a failed
+      // ensure is not final — the daemon may appear moments later (another
+      // omp spawning it), and this forced reseed is the retry that rescues a
+      // lost final "idle". Skipping it left the controller's dedupe to
+      // swallow the next identical idle — stuck spinner.
+      await controller.reseed();
     })();
   }
 
-  // The send wrapper is stale-guarded like the handlers: a stale activation's
-  // controller still runs its transitions, but they must not reach the bus.
   const controller = new TrayController(pi, async (s) => {
-    if (stale()) return;
     if (!(await sendState(s))) recover();
   });
   controller.attach();
@@ -176,7 +168,6 @@ export default function ompTray(pi: ExtensionAPI) {
   // we are — never a bare sendState, which could reorder against a queued
   // transition.
   pi.on("session_start", async () => {
-    if (stale()) return;
     if (await ensureDaemon()) await controller.force("idle");
   });
 
@@ -184,7 +175,6 @@ export default function ompTray(pi: ExtensionAPI) {
   // the session we are leaving) minus the state forcing: switching sessions
   // does not mean the agent went idle. Name per types.ts on() overload.
   pi.on("session_switch", () => {
-    if (stale()) return;
     void ensureDaemon();
   });
 
@@ -211,7 +201,6 @@ export default function ompTray(pi: ExtensionAPI) {
         : null;
     },
     handler: async (args, ctx) => {
-      if (stale()) return;
       const arg = args.trim().toLowerCase();
       if (arg === "stop" || arg === "off") {
         await stopDaemon();
@@ -269,13 +258,11 @@ export default function ompTray(pi: ExtensionAPI) {
     },
   });
 
-  // session_shutdown fires on process exit (SIGINT/SIGTERM, /quit, /exit).
-  // Signal only the daemon this process spawned (killOwnDaemon): with an
-  // adopted daemon — another omp spawned it — name-targeted stopDaemon()
-  // would stop that omp's tray. /tray stop|off|restart keep stopDaemon():
-  // an explicit user command targets the shared slot.
-  pi.on("session_shutdown", async () => {
-    if (stale()) return;
-    killOwnDaemon();
-  });
+  // Deliberately NO pi.on("session_shutdown", killOwnDaemon): redundant with
+  // process.on("exit", killOwnDaemon) — which covers quit/SIGINT/SIGTERM —
+  // and hazardous, because the event also fires when a subagent CHILD session
+  // is disposed (omp re-binds extension factories per child session: same
+  // module scope, shared daemonPid), so a child's dispose would kill the
+  // shared daemon mid-parent-turn. The controller maps session_shutdown to
+  // the icon state itself; teardown kills only at process exit.
 }

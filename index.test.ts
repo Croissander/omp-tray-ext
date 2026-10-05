@@ -20,7 +20,8 @@ test("allows the host binary when the host is bun", () => {
   expect(resolveDaemonRunner(() => null, "/usr/bin/bun")).toBe("/usr/bin/bun");
 });
 
-// --- extension-level pins: spawn single-flight, generation guard, restart ---
+// --- extension-level pins: spawn single-flight, recovery reseed, no
+// suppression, restart, shutdown-no-kill ---
 
 /** Mutable Bun.spawn slot so tests can stub it; restored in afterEach. */
 const bunMut = Bun as unknown as { spawn: unknown };
@@ -33,8 +34,10 @@ afterEach(() => {
 
 /**
  * Duck-typed MessageBus fake (same surface ipc.test.ts drives): no I/O at
- * all. `alive` answers NameHasOwner, `onSetState` observes sends, `stopFails`
- * rejects the Stop() RPC so stopDaemon() resolves false.
+ * all. `alive` answers NameHasOwner, `onSetState` observes sends (and may
+ * throw to model the daemon dying mid-call), `stopFails` rejects the Stop()
+ * RPC so stopDaemon() resolves false. A SetState while `alive` is false is
+ * lost at the transport: rejected before the observer — never recorded.
  */
 function fakeBus(opts: {
   alive?: () => boolean;
@@ -44,6 +47,8 @@ function fakeBus(opts: {
   const methods = {
     NameHasOwner: () => Promise.resolve(opts.alive?.() ?? true),
     SetState: (state: string) => {
+      // Lost at the transport when the daemon is down — never observed.
+      if (!(opts.alive?.() ?? true)) return Promise.reject(new Error("no daemon"));
       opts.onSetState?.(state);
       return Promise.resolve();
     },
@@ -105,7 +110,62 @@ test("overlapping ensureDaemon calls share one spawn attempt (single-flight pin)
   expect(spawns).toBe(1);
 });
 
-test("stale activation is silent; the newest activation sends (generation pin)", async () => {
+test("a lost final idle is retried even after a failed respawn (reseed-after-failed-ensure pin)", async () => {
+  const sends: string[] = [];
+  const rescue = Promise.withResolvers<void>();
+  let crashed = false;
+  let up = true; // up at load — the activation adopts the daemon, no spawn
+  let spawns = 0;
+  bunMut.spawn = () => {
+    spawns += 1;
+    // The first respawned daemon never claims its DBus name — ensureDaemon's
+    // poll window gives up and resolves false. The NEXT spawn is the daemon
+    // "appearing moments later": its name probe turns true.
+    if (spawns >= 2) up = true;
+    return { pid: 424242, unref() {} };
+  };
+  __setSessionBusForTests(
+    () =>
+      fakeBus({
+        alive: () => up,
+        onSetState: (s) => {
+          sends.push(s);
+          if (s === "idle") rescue.resolve();
+          if (crashed) return;
+          crashed = true;
+          // The daemon dies mid-ack on its first taken call ("a failing first
+          // SetState"): observed but failed, and every later send is lost at
+          // the transport until a respawn brings the daemon back.
+          up = false;
+          throw new Error("daemon died mid-call");
+        },
+      }) as unknown as MessageBus,
+  );
+
+  const cap = stubPi();
+  ompTray(cap.api);
+  // Settle the load-time adopt first so recover() below starts (and the
+  // capture joins) its OWN single-flight attempt.
+  expect(await ensureDaemon()).toBe(true);
+  // The turn: "working" reaches the dying daemon (observed, send fails), the
+  // final "idle" is lost — and the respawn triggered by the loss FAILS.
+  await cap.events.get("agent_start")?.({});
+  const respawn = ensureDaemon(); // joins recover()'s in-flight attempt
+  await cap.events.get("agent_end")?.({});
+  expect(await respawn).toBe(false); // probe stayed false through the window
+
+  // The forced reseed is the retry — await its landing (the real signal, not
+  // a poll). The chain crosses ensureDaemonAttempt's real ~2 s poll window
+  // (Date.now()-driven sleeps inside production code; fake timers cannot
+  // advance that loop deterministically from a test).
+  await rescue.promise;
+  // Pre-fix this await hangs (bun test timeout = the failure): the reseed
+  // was skipped on a failed ensure, and the controller's dedupe swallows
+  // every later identical idle — the list ends at "working".
+  expect(sends.at(-1)).toBe("idle");
+});
+
+test("no activation is suppressed; both send (no-suppression pin)", async () => {
   const sends: string[] = [];
   let spawns = 0;
   bunMut.spawn = () => {
@@ -123,26 +183,21 @@ test("stale activation is silent; the newest activation sends (generation pin)",
   ompTray(first.api);
   ompTray(second.api);
 
-  // Fire the FIRST (stale) activation's captured handlers: one index.ts event
-  // handler and one controller event whose send goes through the gen-guarded
-  // wrapper. Neither may produce any bus traffic.
-  const staleStart = first.events.get("session_start");
-  const staleAgent = first.events.get("agent_start");
-  expect(staleStart).toBeDefined();
-  expect(staleAgent).toBeDefined();
-  await staleStart?.({});
-  await staleAgent?.({});
-  expect(sends).toEqual([]);
-
-  // The SECOND activation's handlers DO send (both event shapes).
-  const freshAgent = second.events.get("agent_start");
-  const freshStart = second.events.get("session_start");
-  expect(freshAgent).toBeDefined();
-  expect(freshStart).toBeDefined();
-  await freshAgent?.({});
+  // omp re-binds extension factories per subagent session WITHOUT
+  // re-evaluating the module — an activation must NEVER be silenced (the
+  // v1.3.0 generation guard silently dropped the first one's queued sends
+  // here, stranding the icon). The FIRST activation's captured agent_start
+  // reaches the bus.
+  const firstAgent = first.events.get("agent_start");
+  expect(firstAgent).toBeDefined();
+  await firstAgent?.({});
   expect(sends).toEqual(["working"]);
-  await freshStart?.({});
-  expect(sends).toEqual(["working", "idle"]);
+
+  // The second activation sends likewise.
+  const secondAgent = second.events.get("agent_start");
+  expect(secondAgent).toBeDefined();
+  await secondAgent?.({});
+  expect(sends).toEqual(["working", "working"]);
   expect(spawns).toBe(0);
 });
 
@@ -175,4 +230,47 @@ test("restart reports failure and spawns nothing when stop fails (restart-failur
 
   expect(notes).toEqual([["Tray restart failed", "error"]]);
   expect(spawns).toBe(0);
+});
+
+test("session_shutdown settles the icon and never kills the daemon (shutdown-no-kill pin)", async () => {
+  const sends: string[] = [];
+  let spawns = 0;
+  let spawned = false;
+  bunMut.spawn = () => {
+    spawns += 1;
+    spawned = true;
+    return { pid: 424242, unref() {} }; // harmless stub — nothing real to signal
+  };
+  // Not adopted: the ensure below must spawn so daemonPid is the stub — the
+  // daemon process "started by ensureDaemon".
+  __setSessionBusForTests(
+    () =>
+      fakeBus({
+        alive: () => spawned,
+        onSetState: (s) => {
+          sends.push(s);
+        },
+      }) as unknown as MessageBus,
+  );
+
+  const cap = stubPi();
+  ompTray(cap.api);
+  await ensureDaemon(); // joins the load-time attempt — exactly one spawn
+  expect(spawns).toBe(1);
+
+  // A turn in progress, then the shutdown. index.ts registers NO
+  // session_shutdown handler (the kill one is deleted: the event also fires
+  // for subagent child disposals, whose re-bound instance shares daemonPid —
+  // a kill there takes the shared daemon down mid-parent-turn). With
+  // process.kill unstubbable and the stub pid harmless the kill itself is
+  // unobservable — so pin what IS captured: it must be the controller's
+  // icon-settling mapping (the bus sees "idle"), never the silent killer
+  // (bus stays silent while it signals daemonPid).
+  await cap.events.get("agent_start")?.({});
+  expect(sends).toEqual(["working"]);
+  await cap.events.get("session_shutdown")?.({});
+  expect(sends).toEqual(["working", "idle"]);
+
+  // Teardown lives on process exit only — and remains registered.
+  expect(process.listeners("exit").some((fn) => fn.name === "killOwnDaemon")).toBe(true);
 });

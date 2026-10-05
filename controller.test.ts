@@ -10,10 +10,28 @@ import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 import { TrayController } from "./controller";
 import type { DaemonState } from "./ipc";
 
-// Minimal stub: we drive transitions directly through the controller's
-// internal transition/flashError, no real event emitter needed.
-function stubApi(): ExtensionAPI {
-  return { on: () => {} } as unknown as ExtensionAPI;
+// Minimal ExtensionAPI double: captures handlers per event (same shape as
+// index.test.ts's stubPi) so the mapping pins can drive them directly.
+// Most tests still reach straight into transition/flashError and just need
+// an `on` that absorbs registrations.
+function stubApi() {
+  const events = new Map<string, (event?: unknown) => unknown>();
+  const api = {
+    on: (event: string, handler: (event?: unknown) => unknown) => {
+      events.set(event, handler);
+    },
+  } as unknown as ExtensionAPI;
+  return { api, events };
+}
+
+// Fire a captured handler the way omp would. Optional lookup: a pre-fix
+// controller missing the handler must fail on the assertion, not crash.
+async function fire(
+  events: Map<string, (event?: unknown) => unknown>,
+  name: string,
+  event?: unknown,
+): Promise<void> {
+  await events.get(name)?.(event);
 }
 
 // Macrotask yield: fully drains the microtask queue before resuming, so the
@@ -36,7 +54,7 @@ test("agent_end after agent_start settles to idle even when sends reorder", asyn
     observed.push(s);
   };
 
-  const c = new TrayController(stubApi(), send);
+  const c = new TrayController(stubApi().api, send);
   // Fire both close together the way omp does (handlers not awaited by omp).
   void c["transition"]("working");
   void c["transition"]("idle");
@@ -60,7 +78,7 @@ test("flashError routes through the chain and cannot overtake a later idle", asy
     observed.push(s);
   };
 
-  const c = new TrayController(stubApi(), send);
+  const c = new TrayController(stubApi().api, send);
   void c["flashError"]();
   // Immediately queue an idle transition — must wait for the error send.
   void c["transition"]("idle");
@@ -77,7 +95,7 @@ test("force always sends, bypassing the transition dedupe", async () => {
     observed.push(s);
   };
 
-  const c = new TrayController(stubApi(), send);
+  const c = new TrayController(stubApi().api, send);
   void c["transition"]("working");
   await drain();
   expect(observed).toEqual(["working"]);
@@ -95,7 +113,7 @@ test("reseed resends the current state after a daemon respawn", async () => {
     observed.push(s);
   };
 
-  const c = new TrayController(stubApi(), send);
+  const c = new TrayController(stubApi().api, send);
   void c["transition"]("working");
   await drain();
   expect(observed).toEqual(["working"]);
@@ -117,7 +135,7 @@ test("reseed sends the state current when its job runs, not at call time", async
     observed.push(s);
   };
 
-  const c = new TrayController(stubApi(), send);
+  const c = new TrayController(stubApi().api, send);
   void c["transition"]("working");
   await drain(); // "working" send in flight, current = "working"
   void c["transition"]("idle"); // queued behind it
@@ -136,7 +154,7 @@ test("flashError does not resend while already flashing", async () => {
     observed.push(s);
   };
 
-  const c = new TrayController(stubApi(), send);
+  const c = new TrayController(stubApi().api, send);
   void c["flashError"]();
   void c["flashError"]();
   await drain();
@@ -152,7 +170,7 @@ test("flashError reverts to the pre-error state after errorMs", async () => {
   };
 
   // 10 ms flash window, so the test only burns ~30 ms of real time.
-  const c = new TrayController(stubApi(), send, 10);
+  const c = new TrayController(stubApi().api, send, 10);
   void c["transition"]("working");
   await drain();
   void c["flashError"]();
@@ -184,7 +202,7 @@ test("flashError measures errorMs from the error send, not from the call", async
   };
 
   const errorMs = 40;
-  const c = new TrayController(stubApi(), send, errorMs);
+  const c = new TrayController(stubApi().api, send, errorMs);
   void c["transition"]("working"); // first send: gated mid-flight
   await drain();
   const tFlash = performance.now();
@@ -225,7 +243,7 @@ test("flashError/transition/flashError burst still reverts to the pre-flash stat
   };
 
   const errorMs = 10;
-  const c = new TrayController(stubApi(), send, errorMs);
+  const c = new TrayController(stubApi().api, send, errorMs);
   void c["transition"]("working");
   await drain();
   // Rapid burst before the chain drains: the middle transition's job clears
@@ -244,4 +262,119 @@ test("flashError/transition/flashError burst still reverts to the pre-flash stat
   // Ends on the pre-flash state ("working"), not stuck "error".
   expect(c.state).toBe("working");
   expect(observed.at(-1)).toBe("working");
+});
+
+test("cache-warm idle replays cannot reopen working (no before_provider_request mapping)", async () => {
+  const observed: DaemonState[] = [];
+  const send = async (s: DaemonState): Promise<void> => {
+    observed.push(s);
+  };
+
+  const { api, events } = stubApi();
+  const c = new TrayController(api, send);
+  c.attach();
+  await fire(events, "agent_start", {});
+  await fire(events, "agent_end", {});
+  await drain();
+  expect(observed).toEqual(["working", "idle"]);
+
+  // The user bug: prompt-cache idle warming replays provider calls while
+  // idle with no run around them. Pre-fix this mapped
+  // before_provider_request → "working" and stranded it
+  // (["working","idle","working"], no agent_end anywhere).
+  await fire(events, "before_provider_request", {});
+  await drain();
+  expect(observed).toEqual(["working", "idle"]);
+});
+
+test("non-loop tool_result while idle: success ignored, error still flashes", async () => {
+  const observed: DaemonState[] = [];
+  const send = async (s: DaemonState): Promise<void> => {
+    observed.push(s);
+  };
+
+  const { api, events } = stubApi();
+  // 50 ms flash window: long enough that the auto-revert cannot race the
+  // assertions below, short enough to leave no dangling timer.
+  const c = new TrayController(api, send, 50);
+  c.attach();
+  await drain();
+  // Standalone tool dispatches (AskTool, extension-driven runs) fire
+  // tool_result with no run around them — success must not flip to working.
+  await fire(events, "tool_result", { isError: false });
+  await drain();
+  expect(observed).toEqual([]);
+  // Errors stay visible even outside a run (ungated, self-reverting flash).
+  await fire(events, "tool_result", { isError: true });
+  await drain();
+  expect(observed).toEqual(["error"]);
+});
+
+test("willContinue agent_end is not a terminal: the run window stays open", async () => {
+  const observed: DaemonState[] = [];
+  const send = async (s: DaemonState): Promise<void> => {
+    observed.push(s);
+  };
+
+  const { api, events } = stubApi();
+  const c = new TrayController(api, send);
+  c.attach();
+  await fire(events, "agent_start", {});
+  await fire(events, "agent_end", { willContinue: true });
+  await drain();
+  // A continuation is already scheduled: idle here would flash a false
+  // terminal between steps of one visible run.
+  expect(observed).toEqual(["working"]);
+  expect(c.state).toBe("working");
+  // Window still open: events inside the continuation keep mapping to
+  // working. force("error") is an external override that moves current away
+  // from "working", so the mapping shows up as a send instead of being
+  // deduped by the transition same-state check.
+  await c.force("error");
+  await fire(events, "tool_execution_start", {});
+  await drain();
+  expect(observed).toEqual(["working", "error", "working"]);
+  // Terminal settle closes the window.
+  await fire(events, "agent_end", {});
+  await drain();
+  expect(observed).toEqual(["working", "error", "working", "idle"]);
+});
+
+test("session switches close a window that never got its agent_end", async () => {
+  const observed: DaemonState[] = [];
+  const send = async (s: DaemonState): Promise<void> => {
+    observed.push(s);
+  };
+
+  const { api, events } = stubApi();
+  const c = new TrayController(api, send);
+  c.attach();
+  // A mid-turn switch disconnects the listeners before the abort, so
+  // agent_end never arrives — the transition event is the only idle close.
+  await fire(events, "agent_start", {});
+  await fire(events, "session_before_switch", {});
+  await drain();
+  expect(observed).toEqual(["working", "idle"]);
+  // And again via session_switch (hosts that skip the before-hook).
+  await fire(events, "agent_start", {});
+  await fire(events, "session_switch", {});
+  await drain();
+  expect(observed).toEqual(["working", "idle", "working", "idle"]);
+});
+
+test("session_shutdown settles a child-stranded working", async () => {
+  const observed: DaemonState[] = [];
+  const send = async (s: DaemonState): Promise<void> => {
+    observed.push(s);
+  };
+
+  const { api, events } = stubApi();
+  const c = new TrayController(api, send);
+  c.attach();
+  // Subagent child sessions dispose (and emit this) before their abort
+  // swallows agent_end — a child run's working must not outlive it.
+  await fire(events, "agent_start", {});
+  await fire(events, "session_shutdown", {});
+  await drain();
+  expect(observed).toEqual(["working", "idle"]);
 });
