@@ -8,6 +8,7 @@
 //   idle    ">_"   (prompt glyph)
 //   working  spinning ring (a rotated circle with a chunk missing)
 import { readFileSync } from "node:fs";
+import { basename } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 import { TrayController } from "./controller";
@@ -24,12 +25,29 @@ function sleep(ms: number): Promise<void> {
   return promise;
 }
 
+/**
+ * Resolve the TS runtime that runs daemon.ts: `bun` from PATH, else the host
+ * binary when the host itself is bun. NEVER `process.execPath` blindly — inside
+ * omp (Bun-compiled) it is omp, and spawning `omp run daemon.ts` starts another
+ * omp session that auto-loads this extension and spawns again without bound
+ * (process storm that froze the machine, 2026-10-05). Missing runner = "no
+ * tray", never "spawn the host".
+ *
+ * @internal `which`/`execPath` injectable for tests (see index.test.ts).
+ */
+export function resolveDaemonRunner(
+  which: (name: string) => string | null = Bun.which,
+  execPath: string = process.execPath,
+): string | null {
+  return which("bun") ?? (basename(execPath) === "bun" ? execPath : null);
+}
+
 async function ensureDaemon(): Promise<boolean> {
   if (await daemonAlive()) return true;
+  const runner = resolveDaemonRunner();
+  if (!runner) return false;
   try {
-    // process.execPath is the bun binary itself (omp loads extensions via
-    // Bun), so we don't depend on `bun` being on the spawned process's PATH.
-    const proc = Bun.spawn([process.execPath, "run", DAEMON_SCRIPT], {
+    const proc = Bun.spawn([runner, DAEMON_SCRIPT], {
       stdio: ["ignore", "ignore", "ignore"],
       detached: true,
     });

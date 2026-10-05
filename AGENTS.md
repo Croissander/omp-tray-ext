@@ -226,8 +226,12 @@ Authoritative: <https://omp.sh/docs/extension-authoring>,
 
 - **Bun is required** (for users too): the extension and daemon are TypeScript
   run directly — no build step, no emitted JS (`noEmit`,
-  `allowImportingTsExtensions`). Spawn uses `process.execPath` (the bun binary
-  itself), never `"bun"` from PATH.
+  `allowImportingTsExtensions`). The daemon is spawned as `bun daemon.ts`
+  (`resolveDaemonRunner`: `Bun.which("bun")`, falling back to `process.execPath`
+  only when its basename is `bun`). NEVER spawn `process.execPath` blindly: omp
+  is a Bun-compiled binary, so it is omp itself — `omp run daemon.ts` starts
+  another omp session that auto-loads this extension and spawns again without
+  bound (process storm that froze the machine, 2026-10-05).
 - **Package manager**: bun (`bun.lock` committed). Node is not supported.
 - **Dependencies**: `dbus-next` is the only runtime dep (pure JS — no native
   builds, keep it that way). `@oh-my-pi/pi-coding-agent` is a devDependency
