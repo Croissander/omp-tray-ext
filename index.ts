@@ -42,7 +42,33 @@ export function resolveDaemonRunner(
   return which("bun") ?? (basename(execPath) === "bun" ? execPath : null);
 }
 
-async function ensureDaemon(): Promise<boolean> {
+// Single-flight spawn attempt shared by overlapping callers: the load-time
+// ensureDaemon(), the session_start/session_switch handlers, recover() and
+// /tray restart all pass the daemonAlive() probe before any of them has
+// spawned, so each would run its own Bun.spawn. daemonPid is last-write-wins:
+// when an extra spawn loses the daemon's exclusive name slot and exits,
+// daemonPid names the DEAD loser while the surviving daemon (also ours) is
+// never killed at exit — orphaned icon. Cleared when the attempt settles so
+// later re-ensures can start a fresh one.
+let ensureInFlight: Promise<boolean> | null = null;
+
+/**
+ * Ensure a tray daemon is running: adopt one that is already alive (another
+ * omp may own the shared slot), else spawn one and wait for its DBus name.
+ * Concurrent callers share a single spawn attempt.
+ *
+ * @internal exported for the single-flight pin in index.test.ts.
+ */
+export function ensureDaemon(): Promise<boolean> {
+  if (ensureInFlight) return ensureInFlight;
+  const attempt = ensureDaemonAttempt().finally(() => {
+    ensureInFlight = null;
+  });
+  ensureInFlight = attempt;
+  return attempt;
+}
+
+async function ensureDaemonAttempt(): Promise<boolean> {
   if (await daemonAlive()) return true;
   const runner = resolveDaemonRunner();
   if (!runner) return false;
@@ -86,8 +112,24 @@ function killOwnDaemon() {
 }
 process.on("exit", killOwnDaemon);
 
+// Generation counter shared across module scopes — see the guard note in
+// ompTray. `as unknown as` mirror of globalThis, same trick as ipc.test.ts.
+const GEN = Symbol.for("omp-tray-ext.gen");
+const gens = globalThis as unknown as { [key: symbol]: number | undefined };
+
 export default function ompTray(pi: ExtensionAPI) {
-  let daemonReady = false;
+  // Generation guard for double-load AND reload: extension modules
+  // RE-EVALUATE on every load (fresh ?mtime import tag) while globalThis
+  // persists, and the same extension can load twice in one process (two path
+  // spellings → two module scopes sharing one process). Each activation bumps
+  // the shared counter; every handler body it registers starts with the
+  // stale() check and NO-OPS silently once a newer activation has taken over —
+  // double-load collapses to one live handler set (newest wins) and a reload
+  // replaces the previous activation cleanly. Deliberately NOT stale-guarded:
+  // process.on("exit", killOwnDaemon) — a stale activation must still reap
+  // its own spawn (the kill is PID-targeted with a /proc identity check).
+  const gen = (gens[GEN] = (gens[GEN] ?? 0) + 1);
+  const stale = () => gens[GEN] !== gen;
 
   // Mid-turn recovery: a failed send means the daemon died or lost the shared
   // slot. Respawn + reseed. NEVER awaited from inside the controller chain —
@@ -99,16 +141,24 @@ export default function ompTray(pi: ExtensionAPI) {
     if (recovering) return;
     recovering = true;
     void (async () => {
+      let ok = false;
       try {
-        daemonReady = await ensureDaemon();
-        if (daemonReady) await controller.reseed();
+        ok = await ensureDaemon();
       } finally {
+        // Drop the flag BEFORE the reseed, not after it: when the reseed's own
+        // send fails, the nested recover() it triggers must be able to start a
+        // NEW recovery — clearing afterwards suppressed that nested recover()
+        // and left nothing to retry once the flag dropped.
         recovering = false;
       }
+      if (ok) await controller.reseed();
     })();
   }
 
+  // The send wrapper is stale-guarded like the handlers: a stale activation's
+  // controller still runs its transitions, but they must not reach the bus.
   const controller = new TrayController(pi, async (s) => {
+    if (stale()) return;
     if (!(await sendState(s))) recover();
   });
   controller.attach();
@@ -116,18 +166,26 @@ export default function ompTray(pi: ExtensionAPI) {
   // Spawn the daemon at load time so the tray appears immediately — not on
   // first prompt. Fire-and-forget: the daemon defaults to "idle" on its own.
   void ensureDaemon().then((ok) => {
-    daemonReady = ok;
     if (!ok) pi.logger?.warn?.("[omp-tray] could not start tray daemon");
     else pi.logger?.info?.("[omp-tray] tray daemon ready");
   });
 
-  // Re-ensure after reload/session-switch (daemon may have been stopped).
-  // force("idle") resets a stale "working" for a new session and force-sends
-  // through the controller chain so a fresh daemon learns where we are —
-  // never a bare sendState, which could reorder against a queued transition.
+  // Re-ensure after reload (the daemon may have been stopped while we were
+  // gone). force("idle") resets a stale "working" for a new session and
+  // force-sends through the controller chain so a fresh daemon learns where
+  // we are — never a bare sendState, which could reorder against a queued
+  // transition.
   pi.on("session_start", async () => {
-    daemonReady = await ensureDaemon();
-    if (daemonReady) await controller.force("idle");
+    if (stale()) return;
+    if (await ensureDaemon()) await controller.force("idle");
+  });
+
+  // Session switch is the same re-ensure (the daemon may have been stopped on
+  // the session we are leaving) minus the state forcing: switching sessions
+  // does not mean the agent went idle. Name per types.ts on() overload.
+  pi.on("session_switch", () => {
+    if (stale()) return;
+    void ensureDaemon();
   });
 
   // `/debug` is an omp builtin, so debug lives as `/tray debug` to avoid the
@@ -153,25 +211,38 @@ export default function ompTray(pi: ExtensionAPI) {
         : null;
     },
     handler: async (args, ctx) => {
+      if (stale()) return;
       const arg = args.trim().toLowerCase();
       if (arg === "stop" || arg === "off") {
         await stopDaemon();
-        daemonReady = false;
         ctx.ui.notify("Tray daemon stopped", "info");
         return;
       }
       if (arg === "restart") {
-        await stopDaemon();
+        // Fail honestly: stopDaemon() resolves true only when the Stop() RPC
+        // completed, and a daemon still alive at the wait deadline may still
+        // own the shared slot — ensureDaemon() would ADOPT it and report a
+        // false "restarted". Neither failure may spawn or adopt; just report.
+        if (!(await stopDaemon())) {
+          ctx.ui.notify("Tray restart failed", "error");
+          return;
+        }
         // Wait until the old daemon is actually gone before respawning: if
         // ensureDaemon() ran while daemonAlive() was still true, it would
         // adopt the dying daemon and never spawn a fresh one. Bounded ~2 s.
         const deadline = Date.now() + 2000;
-        while (Date.now() < deadline && (await daemonAlive(300))) {
+        let alive = await daemonAlive(300);
+        while (alive && Date.now() < deadline) {
           await sleep(100);
+          alive = await daemonAlive(300);
         }
-        daemonReady = await ensureDaemon();
-        if (daemonReady) await controller.reseed();
-        ctx.ui.notify(daemonReady ? "Tray daemon restarted" : "Tray restart failed", daemonReady ? "info" : "error");
+        if (alive) {
+          ctx.ui.notify("Tray restart failed", "error");
+          return;
+        }
+        const ok = await ensureDaemon();
+        if (ok) await controller.reseed();
+        ctx.ui.notify(ok ? "Tray daemon restarted" : "Tray restart failed", ok ? "info" : "error");
         return;
       }
       if (arg === "working" || arg === "error") {
@@ -183,7 +254,6 @@ export default function ompTray(pi: ExtensionAPI) {
         const daemonRunning = await daemonAlive();
         const lines = [
           `daemon running : ${daemonRunning}`,
-          `daemon ready  : ${daemonReady}`,
           `daemon pid    : ${daemonPid ?? "(none)"}`,
           `plugin state  : ${controller.state}`,
           `daemon script : ${DAEMON_SCRIPT}`,
@@ -205,6 +275,7 @@ export default function ompTray(pi: ExtensionAPI) {
   // would stop that omp's tray. /tray stop|off|restart keep stopDaemon():
   // an explicit user command targets the shared slot.
   pi.on("session_shutdown", async () => {
+    if (stale()) return;
     killOwnDaemon();
   });
 }

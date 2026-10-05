@@ -52,7 +52,16 @@ export class TrayController {
     return this.current;
   }
 
-  private transition(state: DaemonState, force = false): Promise<void> {
+  /**
+   * Queue one state send on the chain. A function state resolves INSIDE the
+   * job, not at call time: `current`/`revertTo` only advance when queued jobs
+   * run, so a call-time capture can replay a stale state (and the dedupe then
+   * swallows the real one — stuck spinner).
+   */
+  private transition(
+    state: DaemonState | (() => DaemonState),
+    force = false,
+  ): Promise<void> {
     // Catch so a failing send (e.g. timeout) can't reject the chain and wedge
     // every later state — that would reproduce the stuck-spinning bug.
     this.chain = this.chain
@@ -61,9 +70,10 @@ export class TrayController {
           clearTimeout(this.errorClearTimer);
           this.errorClearTimer = null;
         }
-        if (!force && this.current === state) return;
-        this.current = state;
-        await this.send(state);
+        const next = typeof state === "function" ? state() : state;
+        if (!force && this.current === next) return;
+        this.current = next;
+        await this.send(next);
       })
       .catch(() => {});
     return this.chain;
@@ -76,31 +86,50 @@ export class TrayController {
   }
 
   /** Re-send the current state through the chain — after the daemon was
-   *  (re)spawned, so the fresh daemon learns where we are. */
+   *  (re)spawned, so the fresh daemon learns where we are. `current` is read
+   *  inside the job (like `revertTo`): with a chain backlog a call-time
+   *  capture replays a stale state and the fresh daemon gets stuck on it. */
   reseed(): Promise<void> {
-    return this.transition(this.current, true);
+    return this.transition(() => this.current, true);
   }
 
   // Error is transient: show "X" briefly (errorMs), then revert to the state
   // that was current before the flash (working or idle).
   private flashError() {
     // Routed through the chain too, so an un-awaited "error" send can't
-    // overtake a subsequent "idle"/"working" and wedge the daemon. Skipped
-    // when already flashing (two tool errors in a row) — the timer reset
-    // below still extends the errorMs window. The revert target is captured
-    // inside the job because `current` only updates when queued jobs run.
+    // overtake a subsequent "idle"/"working" and wedge the daemon. Both the
+    // revert target and the revert timer start inside the job: `current` only
+    // advances when queued jobs run, and a call-time timer burns the flash
+    // inside any chain backlog (and strands it if a later job clears that
+    // timer). A flash already showing just extends the live timer instead of
+    // sending "error" twice.
     this.chain = this.chain
       .then(async () => {
-        if (this.current === "error") return;
+        if (this.current === "error") {
+          this.armErrorTimer();
+          return;
+        }
         this.revertTo = this.current;
         this.current = "error";
-        await this.send("error");
+        try {
+          await this.send("error");
+        } finally {
+          // Armed even when the send failed, so `current` cannot wedge on
+          // "error" with no timer left to clear it.
+          this.armErrorTimer();
+        }
       })
       .catch(() => {});
+  }
+
+  // Always replaces the previous handle, so overlapping flashes never leak
+  // timers.
+  private armErrorTimer() {
     clearTimeout(this.errorClearTimer ?? undefined);
     this.errorClearTimer = setTimeout(() => {
       this.errorClearTimer = null;
-      void this.transition(this.revertTo);
+      // Revert target is read when the revert is sent, not when armed.
+      void this.transition(() => this.revertTo);
     }, this.errorMs);
   }
 
@@ -129,11 +158,6 @@ export class TrayController {
         return;
       }
       await this.transition("working");
-    });
-
-    this.pi.on("turn_end", async () => {
-      // turn_end fires between sub-turns in a multi-step turn; don't flip to
-      // idle here. Only agent_end marks the whole agent loop as done.
     });
 
     this.pi.on("agent_end", async () => {

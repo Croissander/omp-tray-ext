@@ -105,6 +105,31 @@ test("reseed resends the current state after a daemon respawn", async () => {
   expect(observed).toEqual(["working", "working"]);
 });
 
+test("reseed sends the state current when its job runs, not at call time", async () => {
+  const observed: DaemonState[] = [];
+  const { promise: busy, resolve: blockWorking } = Promise.withResolvers<void>();
+  let firstSend = true;
+  const send = async (s: DaemonState): Promise<void> => {
+    if (firstSend) {
+      firstSend = false;
+      await busy;
+    }
+    observed.push(s);
+  };
+
+  const c = new TrayController(stubApi(), send);
+  void c["transition"]("working");
+  await drain(); // "working" send in flight, current = "working"
+  void c["transition"]("idle"); // queued behind it
+  void c.reseed(); // queued last — must NOT capture the stale "working"
+  blockWorking();
+  await drain();
+  // The respawned daemon must learn the settled state. A call-time capture
+  // lands "working" last (as if reseeded mid-flight) and the fresh daemon
+  // spins forever while the plugin is idle.
+  expect(observed).toEqual(["working", "idle", "idle"]);
+});
+
 test("flashError does not resend while already flashing", async () => {
   const observed: DaemonState[] = [];
   const send = async (s: DaemonState): Promise<void> => {
@@ -142,4 +167,81 @@ test("flashError reverts to the pre-error state after errorMs", async () => {
   // Reverts to "working" (the pre-error state), NOT hardcoded idle.
   expect(observed).toEqual(["working", "error", "working"]);
   expect(c.state).toBe("working");
+});
+
+test("flashError measures errorMs from the error send, not from the call", async () => {
+  const sent: DaemonState[] = [];
+  const sentAt: number[] = [];
+  const { promise: busy, resolve: blockFirst } = Promise.withResolvers<void>();
+  let firstSend = true;
+  const send = async (s: DaemonState): Promise<void> => {
+    if (firstSend) {
+      firstSend = false;
+      await busy;
+    }
+    sent.push(s);
+    sentAt.push(performance.now());
+  };
+
+  const errorMs = 40;
+  const c = new TrayController(stubApi(), send, errorMs);
+  void c["transition"]("working"); // first send: gated mid-flight
+  await drain();
+  const tFlash = performance.now();
+  void c["flashError"](); // queued behind the gated send
+  // Real-clock waits below: fake timers cannot drive this test — the
+  // call-time-armed timer (pre-fix) and the send-time-armed timer must fire
+  // in the gaps BETWEEN real chain drains, and that interleaving lives in
+  // the platform clock, not in an advanceTimersByTime step.
+  // Hold the chain past errorMs: a call-time timer would fire (and revert)
+  // before the error ever went out, truncating the flash to ~0.
+  const { promise: held, resolve: unhold } = Promise.withResolvers<void>();
+  setTimeout(unhold, errorMs + 30);
+  await held;
+  blockFirst();
+  await drain(); // "working" then "error" are out now
+  // Wait out the revert window: it runs ~errorMs after the error send.
+  const { promise: ticked, resolve: tick } = Promise.withResolvers<void>();
+  setTimeout(tick, 2 * errorMs);
+  await ticked;
+  await drain();
+
+  const errIdx = sent.indexOf("error");
+  expect(errIdx).toBeGreaterThan(-1);
+  expect(sent[errIdx + 1]).toBe("working"); // reverts to the pre-flash state
+  const tError = sentAt[errIdx]!;
+  const tRevert = sentAt[errIdx + 1]!;
+  // The window runs from the send, not from flashError() — a queued flash
+  // must not burn its errorMs inside the chain backlog.
+  expect(tRevert - tError).toBeGreaterThanOrEqual(errorMs * 0.6);
+  expect(tRevert - tError).toBeLessThanOrEqual(errorMs + 150);
+  expect(tRevert - tFlash).toBeGreaterThan(errorMs);
+});
+
+test("flashError/transition/flashError burst still reverts to the pre-flash state", async () => {
+  const observed: DaemonState[] = [];
+  const send = async (s: DaemonState): Promise<void> => {
+    observed.push(s);
+  };
+
+  const errorMs = 10;
+  const c = new TrayController(stubApi(), send, errorMs);
+  void c["transition"]("working");
+  await drain();
+  // Rapid burst before the chain drains: the middle transition's job clears
+  // whatever timer was armed at call time, so the second flash must re-arm
+  // when ITS error goes out — otherwise "error" never clears.
+  void c["flashError"]();
+  void c["transition"]("working");
+  void c["flashError"]();
+  await drain();
+  // Real-clock wait past the flash window (fake timers can't drive this —
+  // the flash timer must fire between chain drains).
+  const { promise: flashed, resolve: tick } = Promise.withResolvers<void>();
+  setTimeout(tick, 3 * errorMs);
+  await flashed;
+  await drain();
+  // Ends on the pre-flash state ("working"), not stuck "error".
+  expect(c.state).toBe("working");
+  expect(observed.at(-1)).toBe("working");
 });

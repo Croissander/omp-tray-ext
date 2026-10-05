@@ -22,7 +22,7 @@ and pushed as `IconPixmap` ARGB data over DBus.
 | Agent state | Tray icon | SNI `Status` | Fires on |
 |-------------|-----------|--------------|----------|
 | idle | `>_` prompt glyph | `Active` | `session_start` / `agent_end` |
-| working | spinning ring (rotated circle, chunk missing; monochrome) | `Active` | `agent_start` / `before_provider_request` / `tool_execution_start` |
+| working | spinning ring (rotated circle, chunk missing; monochrome) | `Active` | `agent_start` / `before_provider_request` / `message_start` (assistant) / `tool_execution_start` / `tool_result` (success) |
 | error | `X` crossed strokes | `NeedsAttention` | `tool_result` with `isError` (auto-clears after 5 s, reverting to the pre-error `working`/`idle` state) |
 
 The spinner animates at ~8 fps while the agent is working — each frame is a
@@ -35,13 +35,25 @@ The extension registers a `/tray` slash command inside omp:
 ```
 /tray                show daemon running state (default)
 /tray stop | off     stop the daemon (tray icon disappears)
-/tray restart        stop + re-spawn the daemon (current state preserved)
+/tray restart        stop + re-spawn the daemon (state re-seeded; failure is
+                     reported honestly instead of adopting a dying daemon)
 /tray working        force the tray to the working spinner
 /tray error          force the tray to the error glyph
 /tray debug          show plugin/daemon state for troubleshooting
 ```
 
-Subcommands autocomplete as you type them.
+Subcommands autocomplete as you type them. `/tray debug` prints one fact per
+line:
+
+```
+daemon running : true
+daemon pid    : 4242
+plugin state  : idle
+daemon script : /home/you/.omp/agent/extensions/omp-tray-ext/daemon.ts
+model         : anthropic/claude-sonnet-4
+agent idle    : true
+cwd           : /home/you/project
+```
 
 ## Architecture
 
@@ -49,7 +61,10 @@ A **detached daemon** owns the tray; the omp extension spawns it at load and
 signals it on quit, forwarding state over DBus IPC. One daemon serves every
 omp on the session bus (single shared icon, last writer wins); process
 teardown stops only the daemon that instance spawned. A daemon dying
-mid-turn is respawned on the next state event.
+mid-turn is respawned on the next state event. The icon survives panel and
+DE restarts: the daemon watches the StatusNotifierWatcher and re-registers
+whenever one appears, so the tray also shows up when the daemon starts
+before the panel does.
 
 ```
 omp process (transient)          tray daemon (tied to omp lifetime)
@@ -64,10 +79,13 @@ omp process (transient)          tray daemon (tied to omp lifetime)
 ```
 
 - `index.ts` — extension entry; owns `session_start` (`ensureDaemon()` then
-  `controller.force("idle")`), spawns the daemon detached, forwards turn events,
-  respawns + reseeds on a failed send, registers the `/tray` command.
-- `daemon.ts` — owns the SNI item + `org.omptray.Daemon` control interface;
-  renders the spinner and responds to `SetState`/`Stop`.
+  `controller.force("idle")`) and `session_switch` (re-ensure), spawns the
+  daemon detached, forwards turn events, respawns + reseeds on a failed send,
+  registers the `/tray` command.
+- `daemon.ts` — owns the SNI item + `org.omptray.Daemon` control interface
+  (exclusive name slot — a competing daemon exits cleanly, no name stealing);
+  re-registers with a (re)appearing StatusNotifierWatcher; renders the
+  spinner and responds to `SetState`/`Stop`.
 - `ipc.ts` — shared DBus client: `daemonAlive`, `sendState`, `stopDaemon`.
 - `controller.ts` — maps omp turn events to `idle`/`working`/`error`;
   `attach()` maps turn events only — `session_start` is owned by `index.ts`.
@@ -111,7 +129,7 @@ omp --extension ./omp-tray-ext
 **Option D — install via the `omp` CLI (pinned to a release tag):**
 
 ```bash
-omp install github:Croissander/omp-tray-ext#v1.2.0
+omp install github:Croissander/omp-tray-ext#v1.3.0
 ```
 
 Always install with a `#vX.Y.Z` tag (or `#master`) — a bare `git@...` spec gets
@@ -128,8 +146,18 @@ imports the TypeScript directly via Bun.
 ```bash
 bun install          # one-time; dbus-next only
 bunx tsc --noEmit    # typecheck (strict)
-bun test             # full suite (index + controller + icons + daemon tests)
+bun test             # full suite (5 files: index + controller + icons + daemon + ipc)
+bun test index.test.ts
+bun test controller.test.ts
+bun test icons.test.ts
+bun test daemon.test.ts
+bun test ipc.test.ts
 ```
+
+The daemon and ipc suites are hermetic: they run against a private throwaway
+`dbus-daemon` session (with a fake StatusNotifierWatcher) or duck-typed fake
+buses — never the real session bus. Tests that need `dbus-daemon` self-skip
+when the binary is not installed.
 
 Contributing guidance lives in [AGENTS.md](AGENTS.md): architecture,
 invariants, code conventions, testing patterns, and the release/version
@@ -145,6 +173,7 @@ policy (bump + tag + push — tags are what `omp install` keys on).
 
 - **One tray icon per session bus (by design).** Concurrent omp instances
   share a single icon and their states interleave on it (last writer wins).
-  Exactly one daemon serves the bus — a newer instance takes the slot over
-  atomically and the previous daemon exits cleanly. Per-instance icons are
-  the upgrade path if interleaving becomes a problem.
+  Exactly one daemon serves the bus — the name slot is exclusive (no name
+  stealing): a competing daemon start exits cleanly and the running daemon
+  keeps the icon. Per-instance icons are the upgrade path if interleaving
+  becomes a problem.

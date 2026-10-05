@@ -25,6 +25,36 @@ interface DriverIface {
   NameHasOwner(name: string): Promise<boolean>;
 }
 
+/**
+ * Resolve with `p`'s value, or reject `Error("dbus call timeout")` if `p` is
+ * still unsettled after `ms`; the timer is cleared as soon as `p` settles.
+ *
+ * WHY: dbus-next settles a pending `call()` ONLY when a reply message arrives —
+ * `disconnect()`, connection errors, and remote bus death leave the promise
+ * pending forever (no timeout machinery in the lib). Without this wrapper an
+ * unanswered RPC wedges the caller's serialized state chain for good.
+ */
+export function deadline<T>(p: Promise<T>, ms: number): Promise<T> {
+  const { promise, resolve, reject } = Promise.withResolvers<T>();
+  const t = setTimeout(() => reject(new Error("dbus call timeout")), ms);
+  p.then(
+    (v) => { clearTimeout(t); resolve(v); },
+    (e) => { clearTimeout(t); reject(e); },
+  );
+  return promise;
+}
+
+/** Session-bus factory `connectBus` calls; tests swap it to avoid the real bus. */
+let sessionBus: () => dbus.MessageBus = dbus.sessionBus;
+
+/** @internal test seam: swap the session-bus factory; `null` restores `dbus.sessionBus`. */
+export function __setSessionBusForTests(factory: (() => dbus.MessageBus) | null): void {
+  sessionBus = factory ?? dbus.sessionBus;
+}
+
+/** Milliseconds left until the absolute `until` timestamp (`Date.now()` basis); floors at 0. */
+const budgetLeft = (until: number): number => Math.max(0, until - Date.now());
+
 /** Result of opening a session-bus connection. */
 interface BusConnection {
   bus: dbus.MessageBus | null;
@@ -35,7 +65,7 @@ interface BusConnection {
 function connectBus(timeoutMs = 3000): Promise<BusConnection> {
   let bus: dbus.MessageBus;
   try {
-    bus = dbus.sessionBus();
+    bus = sessionBus();
   } catch {
     return Promise.resolve({ bus: null, ok: false });
   }
@@ -52,14 +82,21 @@ function connectBus(timeoutMs = 3000): Promise<BusConnection> {
   });
 }
 
-/** Ping the daemon: returns true if reachable. `timeoutMs` bounds the bus connect. */
+/**
+ * Ping the daemon: returns true if reachable. `timeoutMs` is ONE absolute
+ * budget covering the bus connect and every RPC below.
+ */
 export async function daemonAlive(timeoutMs = 3000): Promise<boolean> {
-  const conn = await connectBus(timeoutMs);
+  const until = Date.now() + timeoutMs;
+  const conn = await connectBus(budgetLeft(until));
   if (!conn.ok || !conn.bus) return false;
   try {
-    const dbusProxy = await conn.bus.getProxyObject("org.freedesktop.DBus", "/org/freedesktop/DBus");
+    const dbusProxy = await deadline(
+      conn.bus.getProxyObject("org.freedesktop.DBus", "/org/freedesktop/DBus"),
+      budgetLeft(until),
+    );
     const driver = dbusProxy.getInterface<DriverIface & dbus.ClientInterface>("org.freedesktop.DBus");
-    return await driver.NameHasOwner(DAEMON_NAME);
+    return await deadline(driver.NameHasOwner(DAEMON_NAME), budgetLeft(until));
   } catch {
     return false;
   } finally {
@@ -70,15 +107,17 @@ export async function daemonAlive(timeoutMs = 3000): Promise<boolean> {
 /**
  * Send a state update to the daemon. Resolves true iff the daemon accepted it;
  * false when the daemon is unreachable or the send fails — the caller decides
- * on recovery. Never blocks the agent loop on tray IPC.
+ * on recovery. Never blocks the agent loop on tray IPC. `timeoutMs` is ONE
+ * absolute budget covering the bus connect and every RPC.
  */
-export async function sendState(state: DaemonState): Promise<boolean> {
-  const conn = await connectBus();
+export async function sendState(state: DaemonState, timeoutMs = 3000): Promise<boolean> {
+  const until = Date.now() + timeoutMs;
+  const conn = await connectBus(budgetLeft(until));
   if (!conn.ok || !conn.bus) return false;
   try {
-    const proxy = await conn.bus.getProxyObject(DAEMON_NAME, DAEMON_PATH);
+    const proxy = await deadline(conn.bus.getProxyObject(DAEMON_NAME, DAEMON_PATH), budgetLeft(until));
     const control = proxy.getInterface<DaemonControlIface & dbus.ClientInterface>(DAEMON_IFACE);
-    await control.SetState(state);
+    await deadline(control.SetState(state), budgetLeft(until));
     return true;
   } catch {
     // Daemon not up yet, or vanished — caller recovers (respawn + reseed).
@@ -88,16 +127,23 @@ export async function sendState(state: DaemonState): Promise<boolean> {
   }
 }
 
-/** Tell the daemon to release its DBus name and exit (clean tray removal). */
-export async function stopDaemon(): Promise<void> {
-  const conn = await connectBus();
-  if (!conn.ok || !conn.bus) return;
+/**
+ * Tell the daemon to release its DBus name and exit (clean tray removal).
+ * Resolves true iff the `Stop()` RPC completed, false otherwise; never throws.
+ * `timeoutMs` is ONE absolute budget covering the bus connect and every RPC.
+ */
+export async function stopDaemon(timeoutMs = 3000): Promise<boolean> {
+  const until = Date.now() + timeoutMs;
+  const conn = await connectBus(budgetLeft(until));
+  if (!conn.ok || !conn.bus) return false;
   try {
-    const proxy = await conn.bus.getProxyObject(DAEMON_NAME, DAEMON_PATH);
+    const proxy = await deadline(conn.bus.getProxyObject(DAEMON_NAME, DAEMON_PATH), budgetLeft(until));
     const control = proxy.getInterface<DaemonControlIface & dbus.ClientInterface>(DAEMON_IFACE);
-    await control.Stop();
+    await deadline(control.Stop(), budgetLeft(until));
+    return true;
   } catch {
     // daemon not running — nothing to stop
+    return false;
   } finally {
     try { conn.bus.disconnect(); } catch {}
   }
