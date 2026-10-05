@@ -98,7 +98,7 @@ validates the state literal (trust boundary), then emits SNI properties
 
 Flat root — no `src/`; all source, tests, and config live beside each other:
 
-- `*.ts` at root — five modules + three test files (see Important Files).
+- `*.ts` at root — five modules + four test files (see Important Files).
 - `node_modules/` — `bun install` output (gitignored).
 - `.zcode/` — local session/plan artifacts (gitignored).
 - Committed at root: `README.md`, `AGENTS.md`, `LICENSE`, `package.json`,
@@ -109,7 +109,7 @@ Flat root — no `src/`; all source, tests, and config live beside each other:
 ```bash
 bun install                       # one-time; dbus-next only
 bunx tsc --noEmit                 # typecheck (strict) — after every change
-bun test                          # full suite (3 files)
+bun test                          # full suite (4 files)
 bun test controller.test.ts       # single file (each header states its command)
 bun ./icons.ts                    # render glyphs, print pixel counts (visual check)
 ```
@@ -214,6 +214,7 @@ Authoritative: <https://omp.sh/docs/extension-authoring>,
 | `controller.ts` | `TrayController` — event→state mapping + serialized chain |
 | `ipc.ts` | DBus contract constants + client (`daemonAlive`/`sendState`/`stopDaemon`) |
 | `icons.ts` | Glyph drawing + ARGB conversion; `import.meta.main` visual demo |
+| `index.test.ts` | Spawn-runner resolution suite (fork-bomb pin, bun:test) |
 | `controller.test.ts` | Chain-ordering/state-machine suite (bun:test) |
 | `icons.test.ts` | Pixel/ARGB correctness suite (bun:test) |
 | `daemon.test.ts` | `stateView` render-mapping suite (bun:test) |
@@ -250,6 +251,8 @@ Authoritative: <https://omp.sh/docs/extension-authoring>,
 - Framework: **bun:test** (`import { test, expect } from "bun:test"`), flat
   `*.test.ts` beside sources. Full suite `bun test`; each file's header
   comment states its single-file command.
+- `index.test.ts` pins the spawn runner: `resolveDaemonRunner` prefers `bun`
+  from PATH and returns `null` for a non-bun host binary (fork-bomb pin).
 - `controller.test.ts` pins the ordering invariants: FIFO chain under send
   reordering, error flash can't overtake a later idle, `force` bypasses the
   dedupe, `reseed` replays state after a daemon respawn, flash dedupe +

@@ -128,7 +128,7 @@ imports the TypeScript directly via Bun.
 ```bash
 bun install          # one-time; dbus-next only
 bunx tsc --noEmit    # typecheck (strict)
-bun test             # full suite (controller + icons + daemon tests)
+bun test             # full suite (index + controller + icons + daemon tests)
 ```
 
 Contributing guidance lives in [AGENTS.md](AGENTS.md): architecture,
