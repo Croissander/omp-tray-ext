@@ -20,9 +20,10 @@ export interface DaemonControlIface {
   Stop(): Promise<void>;
 }
 
-/** Typed view over the DBus daemon driver for NameHasOwner. */
+/** Typed view over the org.freedesktop.DBus driver (name/owner queries). */
 interface DriverIface {
   NameHasOwner(name: string): Promise<boolean>;
+  GetConnectionUnixProcessID(name: string): Promise<number>;
 }
 
 /**
@@ -99,6 +100,31 @@ export async function daemonAlive(timeoutMs = 3000): Promise<boolean> {
     return await deadline(driver.NameHasOwner(DAEMON_NAME), budgetLeft(until));
   } catch {
     return false;
+  } finally {
+    try { conn.bus.disconnect(); } catch {}
+  }
+}
+
+/**
+ * PID of the process owning the daemon's bus name — one roundtrip answering
+ * both "is the daemon up" (null = nobody owns the name) and "which process
+ * runs it" (the owner-liveness check at adoption). `timeoutMs` is ONE
+ * absolute budget covering the bus connect and every RPC.
+ */
+export async function daemonProcessPid(timeoutMs = 3000): Promise<number | null> {
+  const until = Date.now() + timeoutMs;
+  const conn = await connectBus(budgetLeft(until));
+  if (!conn.ok || !conn.bus) return null;
+  try {
+    const dbusProxy = await deadline(
+      conn.bus.getProxyObject("org.freedesktop.DBus", "/org/freedesktop/DBus"),
+      budgetLeft(until),
+    );
+    const driver = dbusProxy.getInterface<DriverIface & dbus.ClientInterface>("org.freedesktop.DBus");
+    return await deadline(driver.GetConnectionUnixProcessID(DAEMON_NAME), budgetLeft(until));
+  } catch {
+    // No owner for the name (daemon absent) or the call failed — same answer.
+    return null;
   } finally {
     try { conn.bus.disconnect(); } catch {}
   }

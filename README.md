@@ -2,7 +2,7 @@
 
 A native Linux status-bar tray for [Oh My Pi (omp)](https://omp.sh)
 that reflects agent state — idle, working, or errored. The tray icon appears
-when omp starts and is removed when omp exits.
+when omp starts and is removed when omp exits — even on a hard kill.
 
 It implements the freedesktop **StatusNotifierItem (SNI)** spec over the DBus
 session bus, so any SNA-compatible panel renders a real tray icon with zero GUI
@@ -77,12 +77,17 @@ cwd           : /home/you/project
 A **detached daemon** owns the tray; the omp extension spawns it at load and
 shuts it down at process exit, forwarding state over DBus IPC. One daemon
 serves every omp on the session bus (single shared icon, last writer wins),
-and teardown stops only the daemon that instance spawned. What teardown is
-*not*: `session_shutdown` never stops the daemon (it also fires when subagent
+and teardown stops only the daemon that instance spawned. The icon dies WITH
+its app, whatever the death mode: the daemon knows its owner's pid (passed at
+spawn) and exits when the owner process disappears — covering SIGKILL and
+terminal close, where no exit hook can ever run in omp. Clean exits get the
+instant path instead: `process.on("exit")` with a PID + `/proc` cmdline
+identity check so a recycled PID is never signaled. What teardown is *not*:
+`session_shutdown` never stops the daemon (it also fires when subagent
 child sessions are disposed) — it only closes the run window and sends idle.
-Process exit (quit, SIGINT/SIGTERM, terminal close) does the stopping, via
-`process.on("exit")` with a PID + `/proc` cmdline identity check so a recycled
-PID is never signaled. `/tray stop` remains the explicit stop. A daemon dying
+`/tray stop` remains the explicit stop. A daemon already running at startup
+is adopted only when it is owner-bound; an owner-less leftover (e.g. from an
+older version) is stopped and replaced. A daemon dying
 mid-turn is respawned (and its state reseeded) on the next state event. The
 icon survives panel and DE restarts: the daemon watches the
 StatusNotifierWatcher and re-registers whenever one appears, so the tray also
@@ -105,12 +110,16 @@ omp process (transient)          tray daemon (tied to omp lifetime)
   the daemon detached, forwards turn events, respawns + reseeds on a failed
   send (the reseed runs even when the respawn fails — the daemon may appear
   moments later, and the forced reseed retries the lost final idle),
-  registers the `/tray` command, and kills the spawned daemon at process exit.
+  registers the `/tray` command, and kills the spawned daemon at process exit
+  (clean exits only — every other death mode is the daemon's own watchdog's
+  job).
 - `daemon.ts` — owns the SNI item + `org.omptray.Daemon` control interface
   (exclusive name slot — a competing daemon exits cleanly, no name stealing);
   re-registers with a (re)appearing StatusNotifierWatcher; renders the
-  spinner and responds to `SetState`/`Stop`.
-- `ipc.ts` — shared DBus client: `daemonAlive`, `sendState`, `stopDaemon`.
+  spinner and responds to `SetState`/`Stop`; shuts itself down when its
+  owning app dies.
+- `ipc.ts` — shared DBus client: `daemonAlive`, `daemonProcessPid`,
+  `sendState`, `stopDaemon`.
 - `controller.ts` — maps omp events to `idle`/`working`/`error`, turn-windowed
   (see States); `attach()` maps run and session-lifecycle events (when a
   mid-turn switch swallows `agent_end`, `session_before_switch`/

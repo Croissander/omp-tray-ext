@@ -5,7 +5,7 @@
 import { afterEach, expect, test } from "bun:test";
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 import type { MessageBus } from "dbus-next";
-import ompTray, { ensureDaemon, resolveDaemonRunner } from "./index";
+import ompTray, { ensureDaemon, isOwnerless, resolveDaemonRunner } from "./index";
 import { __setSessionBusForTests } from "./ipc";
 
 test("prefers bun from PATH over the host binary", () => {
@@ -21,7 +21,7 @@ test("allows the host binary when the host is bun", () => {
 });
 
 // --- extension-level pins: spawn single-flight, recovery reseed, no
-// suppression, restart, shutdown-no-kill ---
+// suppression, restart, shutdown-no-kill, owner-verified adoption ---
 
 /** Mutable Bun.spawn slot so tests can stub it; restored in afterEach. */
 const bunMut = Bun as unknown as { spawn: unknown };
@@ -41,18 +41,30 @@ afterEach(() => {
  */
 function fakeBus(opts: {
   alive?: () => boolean;
+  /** PID the daemon's name resolves to (adoption owner check); defaults to
+   *  this process — owner-bound, never orphaned. */
+  ownerPid?: number;
   onSetState?: (state: string) => void;
+  onStop?: () => void;
   stopFails?: boolean;
 }) {
   const methods = {
     NameHasOwner: () => Promise.resolve(opts.alive?.() ?? true),
+    GetConnectionUnixProcessID: () =>
+      opts.alive?.() ?? true
+        ? Promise.resolve(opts.ownerPid ?? process.pid)
+        : Promise.reject(new Error("unknown name")),
     SetState: (state: string) => {
       // Lost at the transport when the daemon is down — never observed.
       if (!(opts.alive?.() ?? true)) return Promise.reject(new Error("no daemon"));
       opts.onSetState?.(state);
       return Promise.resolve();
     },
-    Stop: () => (opts.stopFails ? Promise.reject(new Error("stop failed")) : Promise.resolve()),
+    Stop: () => {
+      if (opts.stopFails) return Promise.reject(new Error("stop failed"));
+      opts.onStop?.();
+      return Promise.resolve();
+    },
   };
   return {
     on(event: string, listener: () => void) {
@@ -271,6 +283,49 @@ test("session_shutdown settles the icon and never kills the daemon (shutdown-no-
   await cap.events.get("session_shutdown")?.({});
   expect(sends).toEqual(["working", "idle"]);
 
-  // Teardown lives on process exit only — and remains registered.
+  // Teardown's instant path lives on clean process exits — and remains
+  // registered. (Signal deaths are the daemon's owner watchdog's job.)
   expect(process.listeners("exit").some((fn) => fn.name === "killOwnDaemon")).toBe(true);
+});
+
+test("an owner-less daemon is replaced, never adopted (stale-icon self-heal pin)", async () => {
+  let spawns = 0;
+  let stops = 0;
+  let daemonUp = true; // a legacy orphan holds the slot at load
+  bunMut.spawn = () => {
+    spawns += 1;
+    daemonUp = true; // the replacement claims the slot at spawn
+    return { pid: 424242, unref() {} };
+  };
+  __setSessionBusForTests(
+    () =>
+      fakeBus({
+        alive: () => daemonUp,
+        ownerPid: 2147483647, // no /proc entry — owner-less
+        onStop: () => {
+          stops += 1;
+          daemonUp = false; // the orphan exits on Stop()
+        },
+      }) as unknown as MessageBus,
+  );
+
+  expect(await ensureDaemon()).toBe(true);
+  expect(stops).toBe(1); // the orphan was stopped...
+  expect(spawns).toBe(1); // ...and replaced by an owner-bound daemon
+});
+
+test("isOwnerless: reaped parent = orphaned, live parent = owned (parse pin)", () => {
+  // /proc/<pid>/stat is "pid (comm) state ppid ..." and comm may contain
+  // spaces and parens — only the last ")" closes it.
+  const statWith = (comm: string, ppid: number) => `123 (${comm}) S ${ppid} 11 0 -1 4194304 0 0`;
+  expect(isOwnerless(1, () => statWith("bun daemon.ts", 1))).toBe(true);
+  expect(isOwnerless(1, () => statWith("bun daemon.ts", 4567))).toBe(false);
+  expect(isOwnerless(1, () => statWith("foo) bar (baz", 1))).toBe(true);
+  expect(isOwnerless(1, () => statWith("foo) bar (baz", 4567))).toBe(false);
+  // Vanished between lookup and read: not owned.
+  expect(
+    isOwnerless(1, () => {
+      throw new Error("ENOENT");
+    }),
+  ).toBe(true);
 });

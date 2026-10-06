@@ -28,7 +28,10 @@ omp process (transient)          tray daemon (one per session bus)
   failed sends with an unconditional reseed), owner of the `session_start` /
   `session_switch` re-ensure handlers (`session_shutdown` is mapped in
   `controller.ts` only — index.ts never binds it), `/tray` command,
-  exit-registered PID-checked kill (`killOwnDaemon` — the only kill path).
+  exit-registered PID-checked kill (`killOwnDaemon` — the instant path on
+  clean exits), owner-verified adoption (`isOwnerless` — an owner-less daemon
+  is replaced, never adopted), and the owner pid handed to the daemon's
+  watchdog (argv[2] at spawn).
 - `controller.ts` — `TrayController`: maps omp events to `DaemonState`
   (`"idle" | "working" | "error"`) under a turn window (`inRun`), closes the
   window on terminal `agent_end` and on session transitions, and serializes
@@ -37,15 +40,19 @@ omp process (transient)          tray daemon (one per session bus)
   `/org/omptray/Daemon`) + deadline-bounded client `daemonAlive(timeoutMs?)`,
   `sendState` (resolves `false` on failure), `stopDaemon(timeoutMs?)` (true
   iff `Stop()` completed). Each call opens its own session-bus connection
-  under ONE absolute budget (connect + RPCs, default 3 s). Also exports
-  `deadline()` (shared with `daemon.ts`) and the `__setSessionBusForTests`
-  `@internal` bus-factory seam.
+  under ONE absolute budget (connect + RPCs, default 3 s), plus
+  `daemonProcessPid(timeoutMs?)` (the daemon's owning pid, null when the name
+  is unowned — the adoption owner check). Also exports `deadline()` (shared
+  with `daemon.ts`) and the `__setSessionBusForTests` `@internal` bus-factory
+  seam.
 - `daemon.ts` — detached process owning the SNI item (its signals are the
   cross-host update contract — see flow below), the minimal
   `com.canonical.dbusmenu` at `/MenuBar` (empty layout; GNOME needs a live
   `Menu` path to show the icon at all), and the `org.omptray.Daemon` control
   interface (`SetState`, `Stop`); spinner timer (8 frames @120 ms),
-  `paint()`/`render()` SNI updates, watcher (re-)registration, bus self-probe.
+  `paint()`/`render()` SNI updates, watcher (re-)registration, bus self-probe,
+  and the owner-liveness watchdog (exits when the owning app dies, whatever
+  the death mode).
 - `icons.ts` — pure 22×22 pixel glyphs (no font/image library): `>_` prompt,
   `X` error, 8 spinner frames; RGBA→ARGB converter.
 
@@ -65,9 +72,11 @@ deliberate, it fires mid-loop. `session_before_switch` / `session_switch` /
 `agent_end`; subagent child disposals emit `session_shutdown`). `index.ts`
 handles `session_start` (`ensureDaemon()` then `controller.force("idle")`)
 and `session_switch` (re-`ensureDaemon()` only — switching sessions is not an
-idle signal); teardown is the exit-registered `killOwnDaemon()` (PID-targeted
-with a `/proc/<pid>/cmdline` identity check — never another omp's daemon) plus
-the explicit `/tray stop` — `session_shutdown` never stops the daemon. Sends
+idle signal); teardown is the exit-registered `killOwnDaemon()` on clean
+exits (PID-targeted with a `/proc/<pid>/cmdline` identity check — never
+another omp's daemon), the daemon's owner watchdog for every other death
+mode (see Key invariants), plus the explicit `/tray stop` —
+`session_shutdown` never stops the daemon. Sends
 call `SetState`; the daemon validates the state
 literal (trust boundary), then publishes SNI properties (`IconPixmap`,
 `ToolTip`, `Status`, `AttentionIconPixmap`) and emits `NewIcon`,
@@ -121,22 +130,37 @@ TEXT changes (spinner ticks must not churn it).
   from under a live owner, so a new daemon claims the slot only after the
   previous one exits; deliberate takeover is `/tray restart` (stop + respawn,
   fails honestly — never adopts a daemon still alive at the wait deadline).
-  Process teardown is the exit-registered `process.on("exit", killOwnDaemon)`
-  plus the explicit `/tray stop` — NEVER a `session_shutdown` handler (the
-  event fires for subagent child disposals too, sharing the module-level
+  Process teardown is `process.on("exit", killOwnDaemon)` on clean exits plus
+  the explicit `/tray stop` — NEVER a `session_shutdown` handler (the event
+  fires for subagent child disposals too, sharing the module-level
   `daemonPid`, so a child's dispose would kill the shared daemon mid-parent-
   turn). `killOwnDaemon()` signals only a daemon this process spawned: it
   verifies identity via `/proc/<pid>/cmdline` before SIGTERM (PID-reuse
-  guard). The daemon's
-  SIGTERM handler removes the SNI item cleanly. `process.kill`/
-  `bus.disconnect` on a dead target throws ESRCH — swallowed in `try/catch`.
+  guard). The daemon's SIGTERM handler removes the SNI item cleanly.
+  `process.kill`/`bus.disconnect` on a dead target throws ESRCH — swallowed in
+  `try/catch`. Signal deaths never reach that exit hook (see the owner-lifetime
+  invariant).
+- **The icon dies WITH its app (owner-bound daemon lifetime).** The daemon's
+  argv[2] is its owner's pid (fallback: its parent at boot) and it shuts down
+  when `process.ppid` stops matching — checked at boot (the owner may die
+  before the daemon even starts) and on a 1 s poll. This is the ONLY
+  mechanism covering signal death: `process.on("exit")` never runs when the
+  owner dies by signal (SIGHUP terminal close, SIGINT, SIGTERM, SIGKILL —
+  verified empirically, 2026-10-06), so exit-hook-only teardown leaked the
+  daemon and its icon on every hard close (the stale-icon bug). Adoption
+  enforces the same invariant client-side: `ensureDaemon` ADOPTS only an
+  owner-bound daemon (`isOwnerless` — `/proc/<pid>/stat` ppid 1 or gone) and
+  REPLACES an owner-less one (`stopDaemon` + `waitGone` + spawn) — which also
+  flushes pre-watchdog orphans. Never re-add an "adopt when `daemonAlive()`"
+  gate.
 - **`ensureDaemon` is single-flight; there is deliberately NO generation
   guard (the v1.3.0 `globalThis` generation guard is removed — never
   re-add).** Overlapping callers (load-time ensure, `session_start` /
   `session_switch` handlers, `recover()`, `/tray restart`) share one spawn
   attempt — `daemonPid` is last-write-wins, and a stomped PID would name a
-  dead slot-loser while the surviving daemon is never killed at exit
-  (orphaned icon). omp re-binds extension factories in-process per subagent
+  dead slot-loser while the surviving daemon skips the exit hook: it still
+  dies with its owner via the watchdog (its icon may outlive a clean exit by
+  one 1 s poll). omp re-binds extension factories in-process per subagent
   session WITHOUT re-evaluating the module, so a generation counter silences
   the parent's handlers and drops queued sends the moment any subagent has run
   — dropping the final "idle" strands the icon at "working". Double-load
@@ -163,7 +187,7 @@ TEXT changes (spinner ticks must not churn it).
 - **Every DBus RPC is deadline-bounded.** dbus-next pending calls NEVER settle
   on connection loss (there is no close event) — an unbounded call hangs
   forever. `deadline()` (`ipc.ts`, shared with `daemon.ts`) rejects
-  `Error("dbus call timeout")`; `daemonAlive`/`sendState`/`stopDaemon` run on
+  `Error("dbus call timeout")`; `daemonAlive`/`daemonProcessPid`/`sendState`/`stopDaemon` run on
   ONE absolute `timeoutMs` budget (default 3 s) covering connect + every RPC
   and disconnect in `finally`; daemon-side calls (`requestName`, watcher
   registration, self-probe) use the same wrapper (3 s).
@@ -201,8 +225,13 @@ TEXT changes (spinner ticks must not churn it).
   UNCONDITIONAL — even when the respawn failed: a failed ensure is not final
   (the daemon may appear moments later), and the forced reseed retries the
   lost final "idle" that the dedupe would otherwise swallow.
-- **Known ceiling:** a SIGKILLed omp cannot signal the daemon — a "working"
-  from the killed session can linger until another omp writes state.
+- **Known ceilings:** (a) icon removal after a hard-killed owner lags up to
+  one watchdog poll (1 s) plus the bus's name sweep; (b) an owner-less daemon
+  that got reparented under a subreaper (not pid 1) reads as owned at
+  adoption — `ponytail:`-marked in `isOwnerless`, upgrade path a daemon-side
+  owner-pid handshake; (c) an adopted daemon outlives a closing ADOPTER while
+  its owner omp lives (shared slot, by design) — the next failed send
+  re-heals via `recover()`.
 
 ### Slash-command surface (`/tray`)
 
@@ -230,7 +259,7 @@ Flat root — no `src/`; all source, tests, and config live beside each other:
 ```bash
 bun install                       # one-time; dbus-next only
 bunx tsc --noEmit                 # typecheck (strict) — after every change
-bun test                          # full suite (5 files, 48 tests)
+bun test                          # full suite (5 files, 54 tests)
 bun test controller.test.ts       # single file (each header states its command)
 bun ./icons.ts                    # render glyphs, print pixel counts (visual check)
 ```
@@ -336,16 +365,16 @@ Authoritative: <https://omp.sh/docs/extension-authoring>,
 
 | Path | Role |
 |---|---|
-| `index.ts` | Extension entry (`ompTray` factory), daemon lifetime (single-flight `ensureDaemon`, unconditional-reseed `recover()`, exit-hook PID-checked kill), `/tray` |
-| `daemon.ts` | Detached SNI daemon: `Daemon`, `DaemonControl`, `stateView`, `/MenuBar` dbusmenu, `import.meta.main` entry |
+| `index.ts` | Extension entry (`ompTray` factory), daemon lifetime (single-flight `ensureDaemon`, unconditional-reseed `recover()`, exit-hook PID-checked kill, owner-verified adoption `isOwnerless`), `/tray` |
+| `daemon.ts` | Detached SNI daemon: `Daemon`, `DaemonControl`, `stateView`, `/MenuBar` dbusmenu, `import.meta.main` entry + owner watchdog |
 | `controller.ts` | `TrayController` — turn-windowed event→state mapping + serialized chain (flash timing) |
-| `ipc.ts` | DBus contract constants + deadline-bounded client (`daemonAlive`/`sendState`/`stopDaemon`, `deadline()`, `__setSessionBusForTests`) |
+| `ipc.ts` | DBus contract constants + deadline-bounded client (`daemonAlive`/`daemonProcessPid`/`sendState`/`stopDaemon`, `deadline()`, `__setSessionBusForTests`) |
 | `icons.ts` | Glyph drawing + ARGB conversion; `import.meta.main` visual demo |
-| `index.test.ts` | Spawn-runner resolution + extension pins (single-flight spawn, reseed-after-failed-ensure, no-suppression, shutdown-no-kill, restart failure; bun:test) |
+| `index.test.ts` | Spawn-runner resolution + extension pins (single-flight spawn, reseed-after-failed-ensure, no-suppression, shutdown-no-kill, restart failure, owner-verified adoption + `isOwnerless` parse; bun:test) |
 | `controller.test.ts` | Chain-ordering/state-machine + turn-window mapping + flash-timing pins (bun:test) |
 | `icons.test.ts` | Pixel/ARGB correctness suite (bun:test) |
-| `daemon.test.ts` | `stateView` render-mapping + hermetic lifecycle pins (slot, watcher-restart, SNI conformance, initial-state, SIGTERM-during-startup; bun:test) |
-| `ipc.test.ts` | `deadline` unit pins + fake-bus RPC pins (never-settle, success, disconnect-always; bun:test) |
+| `daemon.test.ts` | `stateView` render-mapping + hermetic lifecycle pins (slot, watcher-restart, SNI conformance, initial-state, SIGTERM-during-startup, owner-lifetime (predecease, stale-icon); bun:test) |
+| `ipc.test.ts` | `deadline` unit pins + fake-bus RPC pins (never-settle, success, disconnect-always, owner-pid probe; bun:test) |
 | `.github/workflows/ci.yml` | CI: `bun install --frozen-lockfile` + gates on push/PR |
 | `package.json` | `omp.extensions` load hook; `name` doubles as `disabledExtensions` key; `version` couples to git tag |
 | `tsconfig.json` | Strict flags — see Runtime/Tooling Preferences |
@@ -377,7 +406,7 @@ Authoritative: <https://omp.sh/docs/extension-authoring>,
 ## Testing & QA
 
 - Framework: **bun:test** (`import { test, expect } from "bun:test"`), flat
-  `*.test.ts` beside sources. Full suite `bun test` (48 tests / 5 files);
+  `*.test.ts` beside sources. Full suite `bun test` (54 tests / 5 files);
   each file's header comment states its single-file command.
 - `index.test.ts` pins the spawn runner and extension lifetime:
   `resolveDaemonRunner` prefers `bun` from PATH and returns `null` for a
@@ -386,7 +415,10 @@ Authoritative: <https://omp.sh/docs/extension-authoring>,
   after a failed respawn (reseed-after-failed-ensure pin); no activation is
   suppressed — both send (no-suppression pin); `session_shutdown` settles the
   icon and never kills the daemon (shutdown-no-kill pin); `/tray restart`
-  failure spawns and adopts nothing (restart-failure pin).
+  failure spawns and adopts nothing (restart-failure pin); an owner-less
+  daemon is stopped and replaced, never adopted (stale-icon self-heal pin);
+  `isOwnerless` parses `stat` ppid (comm with parens/spaces) and treats a
+  vanished pid as owner-less (parse pin).
 - `controller.test.ts` pins the ordering + timing invariants: FIFO chain under
   send reordering, error flash can't overtake a later idle, `force` bypasses
   the dedupe, `reseed` replays state after a daemon respawn AND reads it at
@@ -409,15 +441,20 @@ Authoritative: <https://omp.sh/docs/extension-authoring>,
   slot (one registration + one survivor), watcher-restart re-registration, SNI
   conformance (`Category`/`Menu`/`ItemIsMenu`, `NewStatus` `(s)` payload,
   `NewToolTip` only on tooltip-text change), initial state published before
-  registration, and SIGTERM during the startup connect window exiting promptly
+  registration, SIGTERM during the startup connect window exiting promptly
   (silent Unix-socket listener that accepts but never completes the D-Bus
-  handshake). Self-skips when the `dbus-daemon` binary is missing.
+  handshake), and the owner-lifetime pins (owner-predecease: a daemon whose
+  owner died before it booted exits without registering; stale-icon: a
+  SIGKILLed owner takes the daemon and its names down — the icon dies with
+  its app). Self-skips when the `dbus-daemon` binary is missing.
 - `ipc.test.ts` pins `deadline()` (value passthrough, timeout error, prompt
   original rejection, timer disarmed on settle) and the client calls against a
   fake `MessageBus` (via `__setSessionBusForTests`): never-settling RPCs
   settle `false` fast (the dbus-next never-settle defect), a healthy daemon
   resolves `true` on the default 3 s budget, and every call disconnects the
-  bus exactly once on success and failure paths.
+  bus exactly once on success and failure paths. `daemonProcessPid` gets its
+  own owner-pid probe pins: the owner's pid on success, null fast when the
+  name is unowned or the call hangs.
 - Rule: **tests never touch the real session bus.** The documented deviation
   from "tests never touch DBus" remains `daemon.test.ts`'s private-bus
   harness: it speaks DBus, but only over a PRIVATE throwaway `dbus-daemon`

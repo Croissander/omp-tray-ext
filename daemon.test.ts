@@ -1,16 +1,17 @@
 // Suite: stateView render-mapping (state → (px, status, tooltip, attention)),
 // SNI conformance + lifecycle pins (Category/Menu/ItemIsMenu, NewStatus (s)
 // payload, NewToolTip only on tooltip change, publish-before-register,
-// watcher-restart re-registration, SIGTERM during startup), and the
-// single-instance slot pin — two daemon processes racing on one session bus
-// must yield exactly one StatusNotifierWatcher registration and one
-// surviving daemon.
+// watcher-restart re-registration, SIGTERM during startup), owner-lifetime
+// pins (the daemon dies with its owner, whatever the death mode — the
+// stale-icon fix), and the single-instance slot pin — two daemon processes
+// racing on one session bus must yield exactly one StatusNotifierWatcher
+// registration and one surviving daemon.
 //
 // bun test daemon.test.ts
 
 import dbus from "dbus-next";
 import { expect, test } from "bun:test";
-import { rmSync } from "node:fs";
+import { readFileSync, rmSync } from "node:fs";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { stateView } from "./daemon";
@@ -94,9 +95,11 @@ async function startPrivateBus(): Promise<{ busd: Busd; addr: string }> {
   return { busd, addr };
 }
 
-// Lockstep spawn shape for every daemon under test (5+ call sites).
-function spawnDaemon(addr: string): Child {
-  return Bun.spawn([Bun.which("bun") ?? "bun", "daemon.ts"], {
+// Lockstep spawn shape for every daemon under test (5+ call sites). `ownerArg`
+// becomes argv[2] — the owner pid the watchdog watches (index.ts passes its
+// own pid there); without it the watchdog falls back to this test process.
+function spawnDaemon(addr: string, ownerArg?: string): Child {
+  return Bun.spawn([Bun.which("bun") ?? "bun", "daemon.ts", ...(ownerArg ? [ownerArg] : [])], {
     cwd: import.meta.dir,
     env: { ...process.env, DBUS_SESSION_BUS_ADDRESS: addr },
     stdio: ["ignore", "pipe", "pipe"],
@@ -131,14 +134,22 @@ async function waitFor(check: () => boolean, ms: number, step = 20) {
   while (!check() && Date.now() < until) await Bun.sleep(step);
 }
 
-// Private bus + fake watcher + one daemon child, waiting for the initial
-// watcher registration — that registration is what "daemon up" means.
-async function startRegisteredDaemon() {
+// Private bus + fake StatusNotifierWatcher, no daemon yet (4 call sites). The
+// watcher export also serves the introspection the daemon's getProxyObject
+// lookup needs.
+async function startWatchedBus() {
   const { busd, addr } = await startPrivateBus();
   const watcher = new FakeWatcher();
   const watcherConn = dbus.sessionBus({ busAddress: addr });
   watcherConn.export("/StatusNotifierWatcher", watcher);
   await watcherConn.requestName(WATCHER_NAME, 0);
+  return { busd, addr, watcher, watcherConn };
+}
+
+// Private bus + fake watcher + one daemon child, waiting for the initial
+// watcher registration — that registration is what "daemon up" means.
+async function startRegisteredDaemon() {
+  const { busd, addr, watcher, watcherConn } = await startWatchedBus();
   const children = [spawnDaemon(addr)];
   await waitFor(() => watcher.registrations.length >= 1, 4000, 5);
   return { addr, busd, watcher, watcherConn, children };
@@ -149,13 +160,7 @@ async function startRegisteredDaemon() {
 test.skipIf(!Bun.which("dbus-daemon"))(
   "two concurrent daemon starts yield one watcher registration and one survivor",
   async () => {
-    const { busd, addr } = await startPrivateBus();
-    // Fake StatusNotifierWatcher; the export also serves the introspection
-    // the daemon's getProxyObject lookup needs.
-    const watcher = new FakeWatcher();
-    const watcherConn = dbus.sessionBus({ busAddress: addr });
-    watcherConn.export("/StatusNotifierWatcher", watcher);
-    await watcherConn.requestName(WATCHER_NAME, 0);
+    const { busd, addr, watcher, watcherConn } = await startWatchedBus();
 
     // Both starts in one tick — the concurrent slot claim this pin exists for.
     const children = [spawnDaemon(addr), spawnDaemon(addr)];
@@ -340,3 +345,137 @@ test("SIGTERM during the startup connect window exits promptly", async () => {
     rmSync(sockPath, { force: true });
   }
 });
+
+// ---- Owner-lifetime pins (the stale-icon fix) -------------------------------
+//
+// The icon must disappear WITH its app. An owner often cannot signal us at
+// all: process.on("exit") never runs on signal death (SIGHUP terminal close,
+// SIGINT, SIGTERM, SIGKILL). The daemon's owner watchdog (argv[2] owner pid,
+// ppid comparison) is what takes the icon down then.
+
+test.skipIf(!Bun.which("dbus-daemon"))(
+  "a daemon whose owner died before it booted exits at once (owner-predecease pin)",
+  async () => {
+    const { busd, addr, watcher, watcherConn } = await startWatchedBus();
+    // argv[2] is NOT our parent — the spawn-race state where the owner is
+    // already gone when the daemon first reads its ppid.
+    const child = spawnDaemon(addr, "2147483647");
+    try {
+      // Bounded exit wait — the watchdog runs on the child's own clock, which
+      // fake timers cannot drive (the harness's real-timer rule).
+      const exited = await Promise.race([
+        child.exited.then(() => true),
+        Bun.sleep(3000).then(() => false),
+      ]);
+      expect(exited).toBe(true);
+      // It must never have shown an icon. Proving an absence needs a quiet
+      // period (no event exists to await); real-time like every other
+      // cross-process quiet wait here.
+      await Bun.sleep(300);
+      expect(watcher.registrations.length).toBe(0);
+    } finally {
+      await cleanup([child], [watcherConn], busd);
+    }
+  },
+  15_000,
+);
+
+test.skipIf(!Bun.which("dbus-daemon"))(
+  "the icon dies with its app: a SIGKILLed owner takes the daemon down (stale-icon pin)",
+  async () => {
+    const { busd, addr, watcher, watcherConn } = await startWatchedBus();
+    // Owner stand-in: spawns the daemon exactly like index.ts (owner pid in
+    // argv[2], detached), then lives until SIGKILLed — the death mode where NO
+    // exit hook can ever run in the owner (the pre-fix stale icon).
+    const runner = Bun.which("bun") ?? "bun";
+    const ownerSrc = [
+      `const proc = Bun.spawn([${JSON.stringify(runner)}, "daemon.ts", String(process.pid)], {`,
+      `  cwd: ${JSON.stringify(import.meta.dir)},`,
+      `  env: { ...process.env, DBUS_SESSION_BUS_ADDRESS: ${JSON.stringify(addr)} },`,
+      `  stdio: ["ignore", "ignore", "ignore"],`,
+      `  detached: true,`,
+      `});`,
+      `proc.unref();`,
+      `console.log(String(proc.pid));`,
+      `setInterval(() => {}, 1000);`,
+    ].join("\n");
+    const owner = Bun.spawn([runner, "-e", ownerSrc], {
+      cwd: import.meta.dir,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    const reader = owner.stdout.getReader();
+    const decoder = new TextDecoder();
+    let printed = "";
+    while (!printed.includes("\n")) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      if (value) printed += decoder.decode(value, { stream: true });
+    }
+    void reader.cancel();
+    const daemonPid = Number((printed.split("\n")[0] ?? "").trim());
+    // The icon exists: the daemon registered with the watcher...
+    await waitFor(() => watcher.registrations.length >= 1, 4000, 5);
+    expect(Number.isInteger(daemonPid) && daemonPid > 0).toBe(true);
+
+    try {
+      // ...then the app dies hard: no exit hook, no signal forwarding.
+      owner.kill("SIGKILL");
+      // Bounded reap wait — cleanup must never hang (same rule as cleanup()).
+      await Promise.race([owner.exited, Bun.sleep(2000)]);
+
+      // The daemon follows within one owner poll. A zombie counts as gone: it
+      // is a dead process (connection closed, names released) merely awaiting
+      // a reap — from init, or from us if bun test happens to be a subreaper.
+      const dead = () => {
+        try {
+          const stat = readFileSync(`/proc/${daemonPid}/stat`, "utf8");
+          return stat.slice(stat.lastIndexOf(")") + 2).startsWith("Z");
+        } catch {
+          return true;
+        }
+      };
+      await waitFor(dead, 4000, 50);
+      expect(dead()).toBe(true);
+
+      // Its names are gone with it — the panel drops the icon.
+      const client = dbus.sessionBus({ busAddress: addr });
+      try {
+        const driver = (
+          await client.getProxyObject("org.freedesktop.DBus", "/org/freedesktop/DBus")
+        ).getInterface<{ NameHasOwner(name: string): Promise<boolean> } & dbus.ClientInterface>(
+          "org.freedesktop.DBus",
+        );
+        // The bus's name sweep is async to the death — poll the condition with
+        // a hard bound instead of guessing a delivery delay.
+        let namesReleased = false;
+        await waitFor(() => {
+          if (!namesReleased) {
+            void driver.NameHasOwner(DAEMON_NAME).then(
+              (owned) => {
+                namesReleased = !owned;
+              },
+              () => {
+                namesReleased = true;
+              },
+            );
+          }
+          return namesReleased;
+        }, 2000, 50);
+        expect(namesReleased).toBe(true);
+      } finally {
+        try {
+          client.disconnect();
+        } catch {}
+      }
+    } finally {
+      try {
+        owner.kill("SIGKILL");
+      } catch {}
+      try {
+        process.kill(daemonPid, "SIGKILL");
+      } catch {}
+      await cleanup([], [watcherConn], busd);
+    }
+  },
+  15_000,
+);

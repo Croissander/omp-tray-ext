@@ -12,7 +12,7 @@ import { basename } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 import { TrayController } from "./controller";
-import { daemonAlive, sendState, stopDaemon } from "./ipc";
+import { daemonAlive, daemonProcessPid, sendState, stopDaemon } from "./ipc";
 
 
 const DAEMON_SCRIPT = fileURLToPath(new URL("./daemon.ts", import.meta.url));
@@ -44,12 +44,14 @@ export function resolveDaemonRunner(
 
 // Single-flight spawn attempt shared by overlapping callers: the load-time
 // ensureDaemon(), the session_start/session_switch handlers, recover() and
-// /tray restart all pass the daemonAlive() probe before any of them has
+// /tray restart all pass the daemonProcessPid() probe before any of them has
 // spawned, so each would run its own Bun.spawn. daemonPid is last-write-wins:
 // when an extra spawn loses the daemon's exclusive name slot and exits,
-// daemonPid names the DEAD loser while the surviving daemon (also ours) is
-// never killed at exit — orphaned icon. Cleared when the attempt settles so
-// later re-ensures can start a fresh one.
+// daemonPid names the DEAD loser and the exit hook signals nothing — the
+// surviving daemon (also ours) still dies with this process via its owner
+// watchdog, so at worst its icon lingers one poll past a clean exit.
+// ensureInFlight is cleared when the attempt settles so later re-ensures can
+// start a fresh one.
 let ensureInFlight: Promise<boolean> | null = null;
 
 /**
@@ -68,12 +70,64 @@ export function ensureDaemon(): Promise<boolean> {
   return attempt;
 }
 
+/**
+ * True when `pid` has no living parent — a daemon orphaned by an owner that
+ * died without signaling it (every daemon predating the owner watchdog, plus
+ * any hard-killed owner). Such a daemon is bound to no app and can never
+ * disappear with one: the stale-icon case. Replaced at adoption, never
+ * adopted.
+ * ponytail: ppid 1 is the orphan signal; a subreaper-reparented orphan reads
+ * as owned. Upgrade path: daemon-side owner-pid handshake.
+ *
+ * @internal `statOf` injectable for tests.
+ */
+export function isOwnerless(
+  pid: number,
+  statOf: (pid: number) => string = (p) => readFileSync(`/proc/${p}/stat`, "utf8"),
+): boolean {
+  try {
+    // stat is "pid (comm) state ppid ..."; comm may contain spaces/parens.
+    const stat = statOf(pid);
+    const ppid = stat.slice(stat.lastIndexOf(")") + 2).split(" ")[1];
+    return ppid === "1";
+  } catch {
+    return true; // vanished mid-check — definitely not owned
+  }
+}
+
+/**
+ * Wait until the daemon's exclusive name slot is free (the dying daemon must
+ * release it before a respawn, or the fresh daemon loses the slot race and
+ * exits). Bounded by `ms`; true iff the slot is free.
+ */
+async function waitGone(ms = 2000): Promise<boolean> {
+  const until = Date.now() + ms;
+  let alive = await daemonAlive(300);
+  while (alive && Date.now() < until) {
+    await sleep(100);
+    alive = await daemonAlive(300);
+  }
+  return !alive;
+}
+
 async function ensureDaemonAttempt(): Promise<boolean> {
-  if (await daemonAlive()) return true;
+  const pid = await daemonProcessPid();
+  // Adopt only an owner-bound daemon (another live omp owns the shared slot):
+  // its icon already tracks a live app.
+  if (pid !== null && !isOwnerless(pid)) return true;
+  if (pid !== null) {
+    // Owner-less daemon on the slot: replace it with an owner-bound one so the
+    // icon can again disappear with its app. Wait for its slot to free first
+    // (the /tray restart shape).
+    await stopDaemon();
+    if (!(await waitGone())) return false;
+  }
   const runner = resolveDaemonRunner();
   if (!runner) return false;
   try {
-    const proc = Bun.spawn([runner, DAEMON_SCRIPT], {
+    // argv[2] = our pid: the daemon's owner-watchdog target — it exits when
+    // this process dies, whatever the death mode (see daemon.ts).
+    const proc = Bun.spawn([runner, DAEMON_SCRIPT, String(process.pid)], {
       stdio: ["ignore", "ignore", "ignore"],
       detached: true,
     });
@@ -94,8 +148,10 @@ async function ensureDaemonAttempt(): Promise<boolean> {
   return false;
 }
 
-// ponytail: last-resort synchronous kill on the process-exit path (quit,
-// SIGINT/SIGTERM, SIGHUP terminal close). PID-targeted with a /proc identity
+// Instant synchronous kill on CLEAN exits (quit, process.exit, drained loop).
+// process.on("exit") never runs on signal death (SIGHUP terminal close,
+// SIGINT, SIGTERM, SIGKILL — verified empirically), so those are covered by
+// the daemon's owner watchdog instead. PID-targeted with a /proc identity
 // check: PID reuse could signal an unrelated process, and an adopted daemon
 // (spawned by another omp) is never ours to kill. The daemon's SIGTERM
 // handler removes the SNI item cleanly. Linux-only check is fine — the
@@ -217,15 +273,9 @@ export default function ompTray(pi: ExtensionAPI) {
           return;
         }
         // Wait until the old daemon is actually gone before respawning: if
-        // ensureDaemon() ran while daemonAlive() was still true, it would
-        // adopt the dying daemon and never spawn a fresh one. Bounded ~2 s.
-        const deadline = Date.now() + 2000;
-        let alive = await daemonAlive(300);
-        while (alive && Date.now() < deadline) {
-          await sleep(100);
-          alive = await daemonAlive(300);
-        }
-        if (alive) {
+        // ensureDaemon() ran while the slot was still owned, it would adopt
+        // the dying daemon and never spawn a fresh one.
+        if (!(await waitGone())) {
           ctx.ui.notify("Tray restart failed", "error");
           return;
         }
@@ -258,11 +308,11 @@ export default function ompTray(pi: ExtensionAPI) {
     },
   });
 
-  // Deliberately NO pi.on("session_shutdown", killOwnDaemon): redundant with
-  // process.on("exit", killOwnDaemon) — which covers quit/SIGINT/SIGTERM —
-  // and hazardous, because the event also fires when a subagent CHILD session
-  // is disposed (omp re-binds extension factories per child session: same
-  // module scope, shared daemonPid), so a child's dispose would kill the
-  // shared daemon mid-parent-turn. The controller maps session_shutdown to
-  // the icon state itself; teardown kills only at process exit.
+  // Deliberately NO pi.on("session_shutdown", killOwnDaemon): hazardous — the
+  // event also fires when a subagent CHILD session is disposed (omp re-binds
+  // extension factories per child session: same module scope, shared
+  // daemonPid), so a child's dispose would kill the shared daemon
+  // mid-parent-turn. The controller maps session_shutdown to the icon state
+  // itself; teardown is killOwnDaemon on clean process exits plus the
+  // daemon's owner watchdog for every other death mode.
 }

@@ -10,7 +10,7 @@
 
 import { afterEach, expect, test } from "bun:test";
 import type { MessageBus } from "dbus-next";
-import { __setSessionBusForTests, daemonAlive, deadline, sendState, stopDaemon } from "./ipc";
+import { __setSessionBusForTests, daemonAlive, daemonProcessPid, deadline, sendState, stopDaemon } from "./ipc";
 
 // Restore the real bus factory even when a test fails mid-flight.
 afterEach(() => {
@@ -170,3 +170,32 @@ test("every call disconnects the bus exactly once on success and failure paths",
     }
   }
 }, 5000);
+
+// --- (e) owner-pid probe pin ------------------------------------------------
+
+test("daemonProcessPid resolves the owning process's pid against a healthy daemon", async () => {
+  const fake = fakeBus({ ...healthy, GetConnectionUnixProcessID: () => Promise.resolve(4242) });
+  __setSessionBusForTests(() => fake as unknown as MessageBus);
+  expect(await daemonProcessPid(1000)).toBe(4242);
+  expect(fake.disconnectCount).toBe(1);
+});
+
+test("daemonProcessPid resolves null fast when the name is unowned or the call hangs", async () => {
+  const gone = fakeBus({
+    ...healthy,
+    GetConnectionUnixProcessID: () => Promise.reject(new Error("unknown name")),
+  });
+  __setSessionBusForTests(() => gone as unknown as MessageBus);
+  expect(await daemonProcessPid(1000)).toBeNull();
+  expect(gone.disconnectCount).toBe(1);
+
+  const hanging = fakeBus({
+    ...neverSettling,
+    GetConnectionUnixProcessID: () => new Promise<number>(() => {}),
+  });
+  __setSessionBusForTests(() => hanging as unknown as MessageBus);
+  const start = Date.now();
+  expect(await daemonProcessPid(50)).toBeNull();
+  expect(Date.now() - start).toBeLessThan(500);
+  expect(hanging.disconnectCount).toBe(1);
+});

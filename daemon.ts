@@ -513,6 +513,20 @@ if (import.meta.main) {
   for (const sig of ["SIGTERM", "SIGINT", "SIGHUP"] as const) {
     process.on(sig, die);
   }
+  // Owner-liveness watchdog: the icon must vanish WITH its app, but a closing
+  // omp often cannot signal us — process.on("exit") never runs on signal death
+  // (SIGHUP terminal close, SIGINT, SIGTERM, SIGKILL), so the extension's
+  // exit-hook kill is skipped exactly then. The spawner passes its pid as
+  // argv[2]; when it dies we are reparented (ppid changes) and shut down
+  // within one poll. The boot check covers the owner dying before this
+  // process even started. Manual `bun daemon.ts` runs fall back to the
+  // spawning shell — same rule, die with the shell. The check is stateless
+  // (ppid never changes back), so registration order cannot miss a death.
+  const owner = Number(process.argv[2]) || process.ppid;
+  if (process.ppid !== owner) process.exit(0);
+  setInterval(() => {
+    if (process.ppid !== owner) daemon.shutdown();
+  }, 1000);
   const ok = await daemon.start();
   if (!ok) process.exit(1);
   // Keep the event loop alive for DBus I/O + the spinner timer.
