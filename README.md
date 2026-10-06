@@ -162,17 +162,20 @@ extensions:
 omp --extension ./omp-tray-ext
 ```
 
-**Option D — install via the `omp` CLI (pinned to a release tag):**
+**Option D — install via the `omp` CLI:**
 
 ```bash
-omp install github:Croissander/omp-tray-ext#v1.3.1
+omp install github:Croissander/omp-tray-ext#master
 ```
 
-Always install with a `#vX.Y.Z` tag (or `#master`) — a bare `git@...` spec gets
-pinned to whatever HEAD `bun` first resolved and omp won't detect updates. Use
-the `github:owner/repo#ref` shorthand (not `git@github.com:...git#ref`):
-bun 1.3.x does not parse a `#ref` in scp-style git URLs. To move to a newer
-release later: `omp install --force github:...#vX.Y.Z`.
+`#master` or a `#vX.Y.Z` tag from the
+[tags page](https://github.com/Croissander/omp-tray-ext/tags) — always WITH a
+ref: a bare spec pins whatever HEAD `bun` first resolved and omp then never
+detects updates. Use the `github:owner/repo#ref` shorthand (not
+`git@github.com:...git#ref`): bun 1.3.x does not parse a `#ref` in scp-style
+URLs. **Updating:** `omp install --force github:Croissander/omp-tray-ext#master`
+(or a newer `#vX.Y.Z`), then restart omp — the extension is imported at
+startup, and a running daemon keeps its loaded code until it is respawned.
 
 **Updating:** `git pull` in the cloned directory. No rebuild needed — omp
 imports the TypeScript directly via Bun.
@@ -182,7 +185,7 @@ imports the TypeScript directly via Bun.
 ```bash
 bun install          # one-time; dbus-next only
 bunx tsc --noEmit    # typecheck (strict)
-bun test             # full suite (5 files / 48 tests)
+bun test             # full suite (5 files / 54 tests)
 bun test index.test.ts
 bun test controller.test.ts
 bun test icons.test.ts
