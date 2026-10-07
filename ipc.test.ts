@@ -357,14 +357,17 @@ test("watchSessionActions reconnects when the connection silently dies (probe pi
 test("watchSessionActions never holds the event loop (a short-lived loader can exit)", async () => {
   // The regression this pins: the persistent DBus connection and its timers
   // once kept every short-lived process that loads the extension entry
-  // (omp install) alive forever. Observable contract: a child process that
-  // starts the listener and then simply ENDS must exit by itself — with the
-  // regression it hangs until killed and the race below flips to true.
+  // (omp install) alive forever. Observable contract, checked in a real child
+  // process: the listener unref's the ACTUAL socket field dbus-next exposes
+  // (bus._connection.stream — a wrong field name would silently no-op, hang
+  // the child, and flip the race below to true) and then exits by itself.
   const childScript = `
     const { __setSessionBusForTests, watchSessionActions } = await import(process.cwd() + "/ipc.ts");
+    let unrefCalled = false;
     const bus = {
       on(event, cb) { if (event === "connect") queueMicrotask(cb); },
       disconnect() {},
+      _connection: { stream: { unref: () => { unrefCalled = true; } } },
       getProxyObject: () => Promise.resolve({
         getInterface: () => ({
           on() {},
@@ -374,14 +377,20 @@ test("watchSessionActions never holds the event loop (a short-lived loader can e
     };
     __setSessionBusForTests(() => bus);
     watchSessionActions(() => {}, 50, 20);
+    // Deliberately REF'D: it must fire before the child exits so the marker
+    // lands in stdout — and when it has fired, nothing may keep the process
+    // alive past this point (that is the neutrality being pinned).
+    setTimeout(() => console.log("unref:", unrefCalled), 30);
   `;
   const proc = Bun.spawn([Bun.which("bun") ?? "bun", "-e", childScript], {
     cwd: import.meta.dir,
-    stdout: "ignore",
+    stdout: "pipe",
     stderr: "pipe",
   });
   const hung = await Promise.race([proc.exited.then(() => false), Bun.sleep(5000).then(() => true)]);
   if (hung) proc.kill("SIGKILL");
   await proc.exited;
-  expect(hung).toBe(false);
+  const out = await new Response(proc.stdout).text();
+  expect(hung).toBe(false); // exits by itself — the loop is not held
+  expect(out).toContain("unref: true"); // on the real dbus-next socket path
 });

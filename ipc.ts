@@ -257,9 +257,14 @@ export function watchSessionActions(
         // Event-loop neutrality: a short-lived process that merely loads the
         // extension entry (omp install) must be able to exit — the persistent
         // socket and every park/probe timer are unref'd, so the subscription
-        // lives as long as the host lives but never keeps it alive.
+        // lives as long as the host lives but never keeps it alive. The
+        // socket lives at bus._connection.stream in dbus-next (no public API;
+        // optional-chained so a lib refactor degrades to "ref'd socket", not
+        // a crash). ponytail: upgrade path an unref handle from dbus-next.
         try {
-          (bus as unknown as { stream?: { unref?: () => void } }).stream?.unref?.();
+          (bus as unknown as {
+            _connection?: { stream?: { unref?: () => void } };
+          })._connection?.stream?.unref?.();
         } catch {}
         // Park until the connection dies: an explicit error event, or a
         // failed liveness probe (NameHasOwner — `false` is a HEALTHY answer:
