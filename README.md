@@ -209,14 +209,17 @@ omp --extension ./omp-tray-ext
 omp install github:Croissander/omp-tray-ext#master
 ```
 
-`#master` or a `#vX.Y.Z` tag from the
-[tags page](https://github.com/Croissander/omp-tray-ext/tags) — always WITH a
-ref: a bare spec pins whatever HEAD `bun` first resolved and omp then never
-detects updates. Use the `github:owner/repo#ref` shorthand (not
-`git@github.com:...git#ref`): bun 1.3.x does not parse a `#ref` in scp-style
-URLs. **Updating:** `omp install --force github:Croissander/omp-tray-ext#master`
-(or a newer `#vX.Y.Z`), then restart omp — the extension is imported at
-startup, and a running daemon keeps its loaded code until it is respawned.
+`#master`, a `#vX.Y.Z` tag from the
+[tags page](https://github.com/Croissander/omp-tray-ext/tags), or a bare spec.
+Use the `github:owner/repo#ref` shorthand (not `git@github.com:...git#ref`):
+bun 1.3.x does not parse a `#ref` in scp-style URLs. **Updating:**
+`omp plugin upgrade omp-tray-ext`, then restart omp — the extension is
+imported at startup, and a running daemon keeps its loaded code until it is
+respawned. The upgrade re-resolves the recorded ref through a force-refreshed
+git cache, so `#master`/bare specs track new commits, while a `#vX.Y.Z` spec
+re-resolves that same immutable tag (per-release pinning needs a re-install
+with the new tag). Needs an omp built after 2026-09-29; `omp update
+--plugins` is advertised in its help but inert.
 
 **Updating:** `git pull` in the cloned directory. No rebuild needed — omp
 imports the TypeScript directly via Bun.

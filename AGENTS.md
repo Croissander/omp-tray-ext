@@ -390,8 +390,11 @@ docs-only commits need no bump.
   `docs(readme): ...`).
 - Semver-leaning: → patch for fixes, → minor for new commands/states, → major
   for a DBus contract break.
-- Tags are REQUIRED for `omp install` to detect updates: a bare spec pins the
-  first-resolved HEAD SHA into `bun.lock` and is then treated as satisfied.
+- Tags remain the release ritual (version↔tag coupling) and key per-tag
+  `#vX.Y.Z` installs, but update detection for a `#master` (or bare-spec)
+  install rides `omp plugin upgrade omp-tray-ext` (omp ≥ 2026-09-29), which
+  re-resolves the recorded ref through a force-refreshed git cache and detects
+  git revision moves even without a `package.json` version bump.
 - bun 1.3.x does NOT parse `#ref` in scp-style git URLs
   (`git@github.com:...git#tag` fails) — always use `github:owner/repo#ref`.
 
@@ -401,12 +404,19 @@ git add -A && git commit -m "<scope>: <what changed> (vX.Y.Z)"
 git tag vX.Y.Z && git push origin master --tags
 ```
 
-Stale-lockfile recovery when `omp install --force` still resolves an old SHA:
+Updating an installed copy (omp ≥ 2026-09-29): `omp plugin upgrade
+omp-tray-ext`, then restart omp. A `#master`/bare spec tracks new commits; a
+`#vX.Y.Z` spec re-resolves that same immutable tag, so per-release pinning
+needs a re-`omp install` with the new tag (no prompt, no `--force` — install
+prunes a changed ref's stale manifest edge itself). `omp update --plugins` is
+a dead flag (parsed, discarded — the help lies). Manual recovery when an
+older omp build still resolves an old SHA (try `omp plugin doctor --fix`
+first — it reconciles lock-vs-disk drift):
 
 ```bash
 rm -rf ~/.omp/plugins/node_modules/omp-tray-ext
 # drop the "omp-tray-ext" line from ~/.omp/plugins/package.json and bun.lock
-omp install github:Croissander/omp-tray-ext#vX.Y.Z
+omp install github:Croissander/omp-tray-ext#master
 ```
 
 ## Code Conventions & Common Patterns
