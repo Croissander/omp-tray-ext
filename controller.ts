@@ -44,6 +44,13 @@ export class TrayController {
   // agent_end to settle them back (non-loop tool_result from standalone tool
   // dispatches, idle cache-warm provider replays) and would strand "working".
   private inRun = false;
+  // The run's ctx (captured at agent_start) is the only abort handle omp
+  // gives extensions — pi.abort() does not exist. Structural type: only
+  // abort() is needed here.
+  private runCtx: { abort(): void } | null = null;
+  // Current run detail for the menu header/tooltip — the last tool name.
+  private detail: string | null = null;
+  private pushedDetail: string | null = null;
   // ponytail: serializes state changes so the daemon sees them in the same
   // order the extension emits them. Each sendState opens its own DBus
   // connection (ipc.connectBus) with no cross-connection FIFO, so two
@@ -56,7 +63,7 @@ export class TrayController {
     private pi: ExtensionAPI,
     /** @internal injectable for tests; defaults to the DBus client.
      *  The controller ignores the result (ipc.sendState reports success). */
-    private send: (s: DaemonState) => Promise<unknown> = sendState,
+    private send: (s: DaemonState, detail?: string) => Promise<unknown> = sendState,
     /** @internal injectable for tests; error flash duration in ms. */
     private errorMs = 5000,
   ) {}
@@ -85,12 +92,31 @@ export class TrayController {
           this.errorClearTimer = null;
         }
         const next = typeof state === "function" ? state() : state;
-        if (!force && this.current === next) return;
+        if (next === "idle") {
+          // Cleared BEFORE the await: a newer run's ctx captured while this
+          // send is in flight must survive the idle job finishing.
+          this.runCtx = null;
+        }
+        const detail = next === "idle" ? null : this.detail;
+        // Detail changes send even on a state dedupe: Bash → Edit must reach
+        // the menu header even though the state is still "working".
+        if (!force && this.current === next && this.pushedDetail === detail) return;
         this.current = next;
-        await this.send(next);
+        this.pushedDetail = detail;
+        await this.send(next, detail ?? undefined);
       })
       .catch(() => {});
     return this.chain;
+  }
+
+  /**
+   * Tray menu "Interrupt agent": abort the run whose ctx was captured at
+   * agent_start. No live run (idle, or a forced working with no run behind
+   * it) → a no-op; `abort()` on an already-settled session is harmless.
+   * Deliberately NOT chained: aborting must not wait behind tray sends.
+   */
+  interrupt() {
+    this.runCtx?.abort();
   }
 
   /** External override (/tray working|error): always sends so the daemon and
@@ -148,8 +174,14 @@ export class TrayController {
   }
 
   attach() {
-    this.pi.on("agent_start", async () => {
+    // Capture the run's ctx — the interrupt handle for the tray menu's
+    // "Interrupt agent" (omp exposes abort only via handler ctx). Each
+    // agent_start rebinding targets the newest run; a child session's factory
+    // rebinding overwrites this wholesale (shared-slot semantics, same as
+    // every other send).
+    this.pi.on("agent_start", async (_event, ctx) => {
       this.inRun = true;
+      this.runCtx = ctx;
       await this.transition("working");
     });
 
@@ -164,8 +196,10 @@ export class TrayController {
       }
     });
 
-    this.pi.on("tool_execution_start", async () => {
+    this.pi.on("tool_execution_start", async (event) => {
       if (!this.inRun) return;
+      // The menu header shows what the agent is doing right now.
+      this.detail = event.toolName;
       await this.transition("working");
     });
 

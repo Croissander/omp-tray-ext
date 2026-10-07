@@ -10,7 +10,7 @@
 
 import { afterEach, expect, test } from "bun:test";
 import type { MessageBus } from "dbus-next";
-import { __setSessionBusForTests, daemonAlive, daemonProcessPid, deadline, sendState, stopDaemon } from "./ipc";
+import { __setSessionBusForTests, daemonAlive, daemonProcessPid, deadline, sendState, stopDaemon, watchSessionActions } from "./ipc";
 
 // Restore the real bus factory even when a test fails mid-flight.
 afterEach(() => {
@@ -65,7 +65,7 @@ const neverSettling = {
 // state argument ("working") so the matrix can pass only the timeout.
 const clientCalls = [
   ["daemonAlive", daemonAlive],
-  ["sendState", (ms?: number) => sendState("working", ms)],
+  ["sendState", (ms?: number) => sendState("working", undefined, ms)],
   ["stopDaemon", stopDaemon],
 ] as const;
 
@@ -198,4 +198,154 @@ test("daemonProcessPid resolves null fast when the name is unowned or the call h
   expect(await daemonProcessPid(50)).toBeNull();
   expect(Date.now() - start).toBeLessThan(500);
   expect(hanging.disconnectCount).toBe(1);
+});
+
+// --- (f) run-detail pin ------------------------------------------------------
+
+test("sendState carries the detail over the same connection; a detail failure never fails the send", async () => {
+  const calls: string[] = [];
+  const fake = fakeBus({
+    SetState: () => {
+      calls.push("SetState");
+      return Promise.resolve();
+    },
+    SetDetail: () => {
+      calls.push("SetDetail");
+      return Promise.resolve();
+    },
+  });
+  __setSessionBusForTests(() => fake as unknown as MessageBus);
+  expect(await sendState("working", "Bash")).toBe(true);
+  expect(calls).toEqual(["SetState", "SetDetail"]);
+  expect(fake.disconnectCount).toBe(1); // one connection, two RPCs
+
+  // An older daemon without SetDetail (or a rejected detail): best-effort —
+  // the state send still reports success.
+  calls.length = 0;
+  const partial = fakeBus({
+    SetState: () => {
+      calls.push("SetState");
+      return Promise.resolve();
+    },
+    SetDetail: () => {
+      calls.push("SetDetail");
+      return Promise.reject(new Error("no such method"));
+    },
+  });
+  __setSessionBusForTests(() => partial as unknown as MessageBus);
+  expect(await sendState("working", "Edit")).toBe(true);
+  expect(calls).toEqual(["SetState", "SetDetail"]);
+
+  // No detail passed: only SetState goes out.
+  calls.length = 0;
+  const bare = fakeBus({
+    SetState: () => {
+      calls.push("SetState");
+      return Promise.resolve();
+    },
+    SetDetail: () => {
+      calls.push("SetDetail");
+      return Promise.resolve();
+    },
+  });
+  __setSessionBusForTests(() => bare as unknown as MessageBus);
+  expect(await sendState("idle")).toBe(true);
+  expect(calls).toEqual(["SetState"]);
+});
+
+// --- (g) watchSessionActions pins --------------------------------------------
+
+/** Fake bus for the action listener: subscribes SessionAction, can emit. */
+function fakeActionBus(opts: { probeRejects?: boolean } = {}) {
+  const subscriptions: ((action: string, arg: string) => void)[] = [];
+  const errorListeners: (() => void)[] = [];
+  const bus = {
+    disconnectCount: 0,
+    on(event: string, listener: () => void) {
+      if (event === "connect") queueMicrotask(listener);
+      if (event === "error") errorListeners.push(listener);
+    },
+    disconnect() {
+      this.disconnectCount += 1;
+    },
+    getProxyObject() {
+      return Promise.resolve({
+        getInterface: () => ({
+          // Drives both the control proxy (SessionAction) and the driver
+          // proxy (the liveness probe's NameHasOwner).
+          on: (event: string, cb: (action: string, arg: string) => void) => {
+            if (event === "SessionAction") subscriptions.push(cb);
+          },
+          NameHasOwner: () =>
+            opts.probeRejects ? Promise.reject(new Error("dead socket")) : Promise.resolve(true),
+        }),
+      });
+    },
+    emitAction: (action: string, arg: string) => {
+      for (const cb of subscriptions) cb(action, arg);
+    },
+    emitError: () => {
+      for (const l of errorListeners) l();
+    },
+    subscriptionCount: () => subscriptions.length,
+  };
+  return bus;
+}
+
+async function until(check: () => boolean, ms = 1500): Promise<void> {
+  const end = Date.now() + ms;
+  while (!check() && Date.now() < end) await Bun.sleep(10);
+}
+
+test("watchSessionActions delivers SessionAction payloads and reconnects after a bus error", async () => {
+  const received: [string, string][] = [];
+  const buses: ReturnType<typeof fakeActionBus>[] = [];
+  __setSessionBusForTests(() => {
+    const bus = fakeActionBus();
+    buses.push(bus);
+    return bus as unknown as MessageBus;
+  });
+
+  const stop = watchSessionActions((action, arg) => received.push([action, arg]), 50, 20);
+  try {
+    await until(() => buses[0]?.subscriptionCount() === 1);
+    expect(buses.length).toBe(1); // one persistent connection
+
+    buses[0]!.emitAction("abort", "");
+    buses[0]!.emitAction("prompt", "Commit the changes");
+    expect(received).toEqual([
+      ["abort", ""],
+      ["prompt", "Commit the changes"],
+    ]);
+
+    // The connection dies: the listener re-subscribes on a fresh connection.
+    buses[0]!.emitError();
+    await until(() => buses.length >= 2 && buses[1]?.subscriptionCount() === 1);
+    buses[1]!.emitAction("abort", "again");
+    expect(received.at(-1)).toEqual(["abort", "again"]);
+  } finally {
+    stop();
+  }
+});
+
+test("watchSessionActions reconnects when the connection silently dies (probe pin)", async () => {
+  const buses: ReturnType<typeof fakeActionBus>[] = [];
+  __setSessionBusForTests(() => {
+    // The FIRST connection's probe rejects (dead socket, no error event —
+    // the dbus-next defect); every later connection is healthy.
+    const bus = fakeActionBus({ probeRejects: buses.length === 0 });
+    buses.push(bus);
+    return bus as unknown as MessageBus;
+  });
+
+  const stop = watchSessionActions(() => {}, 50, 20);
+  try {
+    // The failed probe must drop connection #1 and park on #2.
+    await until(() => buses.length >= 2 && buses[1]?.subscriptionCount() === 1);
+    expect(buses[0]?.disconnectCount).toBe(1);
+    await Bun.sleep(60); // no reconnect churn beyond the one recovery
+    expect(buses.length).toBe(2);
+  } finally {
+    stop();
+  }
 });

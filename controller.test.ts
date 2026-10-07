@@ -15,9 +15,9 @@ import type { DaemonState } from "./ipc";
 // Most tests still reach straight into transition/flashError and just need
 // an `on` that absorbs registrations.
 function stubApi() {
-  const events = new Map<string, (event?: unknown) => unknown>();
+  const events = new Map<string, (event?: unknown, ctx?: unknown) => unknown>();
   const api = {
-    on: (event: string, handler: (event?: unknown) => unknown) => {
+    on: (event: string, handler: (event?: unknown, ctx?: unknown) => unknown) => {
       events.set(event, handler);
     },
   } as unknown as ExtensionAPI;
@@ -27,11 +27,12 @@ function stubApi() {
 // Fire a captured handler the way omp would. Optional lookup: a pre-fix
 // controller missing the handler must fail on the assertion, not crash.
 async function fire(
-  events: Map<string, (event?: unknown) => unknown>,
+  events: Map<string, (event?: unknown, ctx?: unknown) => unknown>,
   name: string,
   event?: unknown,
+  ctx?: unknown,
 ): Promise<void> {
-  await events.get(name)?.(event);
+  await events.get(name)?.(event, ctx);
 }
 
 // Macrotask yield: fully drains the microtask queue before resuming, so the
@@ -377,4 +378,54 @@ test("session_shutdown settles a child-stranded working", async () => {
   await fire(events, "session_shutdown", {});
   await drain();
   expect(observed).toEqual(["working", "idle"]);
+});
+
+test("tool_execution_start carries the tool name as detail; idle clears it", async () => {
+  const sent: [DaemonState, string | undefined][] = [];
+  const send = async (s: DaemonState, detail?: string): Promise<void> => {
+    sent.push([s, detail]);
+  };
+
+  const { api, events } = stubApi();
+  const c = new TrayController(api, send);
+  c.attach();
+  await fire(events, "agent_start", {});
+  await fire(events, "tool_execution_start", { toolName: "Bash" });
+  // A second tool while still working: the STATE send dedupes, but the tool
+  // change must still reach the menu header.
+  await fire(events, "tool_execution_start", { toolName: "Edit" });
+  await fire(events, "agent_end", {});
+  await drain();
+  expect(sent).toEqual([
+    ["working", undefined],
+    ["working", "Bash"],
+    ["working", "Edit"],
+    ["idle", undefined],
+  ]);
+});
+
+test("interrupt aborts the captured run ctx and stops after the run settles", async () => {
+  const sent: DaemonState[] = [];
+  const send = async (s: DaemonState): Promise<void> => {
+    sent.push(s);
+  };
+
+  const { api, events } = stubApi();
+  const c = new TrayController(api, send);
+  c.attach();
+  // Interrupt with no live run: a harmless no-op, never a throw.
+  expect(() => c.interrupt()).not.toThrow();
+
+  const aborts: number[] = [];
+  await fire(events, "agent_start", {}, { abort: () => aborts.push(1) });
+  c.interrupt();
+  expect(aborts).toEqual([1]);
+
+  // The menu item is daemon-gated to "working", but a stale ctx must not
+  // abort anything after the run settles: cleared with the idle send.
+  await fire(events, "agent_end", {});
+  await drain();
+  c.interrupt();
+  expect(aborts).toEqual([1]);
+  expect(sent).toEqual(["working", "idle"]);
 });

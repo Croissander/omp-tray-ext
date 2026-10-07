@@ -12,7 +12,7 @@ import { basename } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 import { TrayController } from "./controller";
-import { daemonAlive, daemonProcessPid, sendState, stopDaemon } from "./ipc";
+import { daemonAlive, daemonProcessPid, sendState, stopDaemon, watchSessionActions } from "./ipc";
 
 
 const DAEMON_SCRIPT = fileURLToPath(new URL("./daemon.ts", import.meta.url));
@@ -168,6 +168,23 @@ function killOwnDaemon() {
 }
 process.on("exit", killOwnDaemon);
 
+// Tray-menu agent actions flow daemon → extension as SessionAction signals.
+// ONE listener per process, started once: omp re-binds extension factories
+// per subagent (child) session without re-evaluating the module, and two live
+// subscriptions would deliver every menu click twice (double prompts).
+// actionRoute is last-write-wins like daemonPid — the newest factory's
+// session handles the actions.
+let actionRoute: ((action: string, arg: string) => void) | null = null;
+let actionListenerStarted = false;
+
+function ensureActionListener() {
+  if (actionListenerStarted) return;
+  actionListenerStarted = true;
+  // Fire-and-forget: watchSessionActions owns its reconnect loop and warns on
+  // handler errors; nothing here may block or reject into the omp flow.
+  void watchSessionActions((action, arg) => actionRoute?.(action, arg));
+}
+
 export default function ompTray(pi: ExtensionAPI) {
   // Deliberately NO globalThis generation/staleness guard (the v1.3.0 one is
   // removed): omp re-binds extension factories in-process per subagent
@@ -206,10 +223,29 @@ export default function ompTray(pi: ExtensionAPI) {
     })();
   }
 
-  const controller = new TrayController(pi, async (s) => {
-    if (!(await sendState(s))) recover();
+  const controller = new TrayController(pi, async (s, detail) => {
+    if (!(await sendState(s, detail))) recover();
   });
   controller.attach();
+
+  // Route the tray menu's agent actions to THIS session. Trust boundary:
+  // only the daemon can emit SessionAction (bus matches sender=name), but the
+  // action kind is still validated — unknown kinds are dropped with a warn.
+  // "prompt" texts are BY DESIGN arbitrary: they are the menu's quick prompts
+  // the user clicked.
+  actionRoute = (action, arg) => {
+    if (action === "abort") {
+      controller.interrupt();
+      return;
+    }
+    if (action === "prompt" && arg) {
+      // omp semantics: idle → starts a turn; streaming → queues as steer.
+      pi.sendUserMessage(arg);
+      return;
+    }
+    pi.logger?.warn?.(`[omp-tray] ignoring unknown tray action: ${String(action)}`);
+  };
+  ensureActionListener();
 
   // Spawn the daemon at load time so the tray appears immediately — not on
   // first prompt. Fire-and-forget: the daemon defaults to "idle" on its own.

@@ -24,6 +24,20 @@ interface PropsIface {
   GetAll(name: string): Promise<Record<string, dbus.Variant>>;
 }
 
+/** Typed client view over the daemon's dbusmenu at /MenuBar. */
+interface DaemonMenuIface {
+  GetLayout(parentId: number, recursionDepth: number, propertyNames: string[]): Promise<[number, [number, Record<string, dbus.Variant>, dbus.Variant[]]]>;
+  GetGroupProperties(ids: number[], propertyNames: string[]): Promise<[number, Record<string, dbus.Variant>][]>;
+  GetProperty(id: number, name: string): Promise<dbus.Variant>;
+  Event(id: number, eventId: string, data: dbus.Variant, timestamp: number): Promise<void>;
+  AboutToShow(id: number): Promise<boolean>;
+}
+
+/** Control interface plus the SessionAction signal a client subscribes to. */
+interface DaemonControlWithActions extends DaemonControlIface {
+  on(event: "SessionAction", handler: (action: string, arg: string) => void): unknown;
+}
+
 test("working maps to the spinner frame for the current frame", () => {
   const v = stateView("working", 3);
   expect(v.px).toBe(spinnerFrameByIndex(3));
@@ -73,7 +87,12 @@ test("ownerTtyNr parses tty_nr from stat and never reads a bad stat as terminal-
 // ---- Hermetic private-bus harness ------------------------------------------
 
 const WATCHER_NAME = "org.kde.StatusNotifierWatcher";
+const DBUSMENU_IFACE = "com.canonical.dbusmenu";
 const { interface: iface } = dbus;
+
+/** One (ia{sv}av) layout node as the client deserializes it. */
+type MenuNode = [number, Record<string, dbus.Variant>, unknown[]];
+const childNode = (parent: MenuNode, i: number): MenuNode => (parent[2][i] as dbus.Variant).value as MenuNode;
 
 class FakeWatcher extends iface.Interface {
   readonly registrations: string[] = [];
@@ -274,7 +293,8 @@ test.skipIf(!Bun.which("dbus-daemon"))(
       const all = (await props.GetAll("org.kde.StatusNotifierItem")) as Record<string, dbus.Variant>;
       expect(String(all.Category?.value ?? "")).not.toBe("");
       expect(["", "/NO_DBUSMENU"]).not.toContain(String(all.Menu?.value ?? ""));
-      expect(all.ItemIsMenu?.value).toBe(false);
+      // The menu is real now (v1.4.0 dbusmenu): hosts are told it exists.
+      expect(all.ItemIsMenu?.value).toBe(true);
 
       const sni = item.getInterface("org.kde.StatusNotifierItem");
       const statuses: unknown[] = [];
@@ -300,6 +320,149 @@ test.skipIf(!Bun.which("dbus-daemon"))(
       // daemon child, whose timers fake timers cannot drive.
       await Bun.sleep(500);
       expect(tooltipSignals).toBe(1);
+    } finally {
+      await cleanup(children, [watcherConn, client], busd);
+    }
+  },
+  15_000,
+);
+
+// ---- Menu layout + live-property pins --------------------------------------
+
+test.skipIf(!Bun.which("dbus-daemon"))(
+  "menu serves the static item tree with a live header and detail",
+  async () => {
+    const { addr, busd, watcher, watcherConn, children } = await startRegisteredDaemon();
+    const client = dbus.sessionBus({ busAddress: addr });
+    try {
+      const service = watcher.registrations[0] ?? "";
+      expect(service).not.toBe("");
+      const menuObj = await client.getProxyObject(service, "/MenuBar");
+      const menu = menuObj.getInterface<DaemonMenuIface & dbus.ClientInterface>(DBUSMENU_IFACE);
+
+      const [revision, root] = await menu.GetLayout(0, -1, []);
+      expect(revision).toBe(1); // static tree — the revision never moves
+      const [rootId, rootProps, kids] = root;
+      expect(rootId).toBe(0);
+      expect(Object.keys(rootProps).length).toBe(0);
+      expect(kids.map((_, i) => childNode(root, i)[0])).toEqual([1, 2, 3, 4, 8, 9, 14]);
+
+      const propsOf = (i: number): Record<string, dbus.Variant> => childNode(root, i)[1];
+      // Informational header (disabled) shows the live state; Interrupt is
+      // offered only while working.
+      expect(String(propsOf(0).label?.value)).toBe("omp — Idle");
+      expect(propsOf(0).enabled?.value).toBe(false);
+      expect(String(propsOf(2).label?.value)).toBe("Interrupt agent");
+      expect(propsOf(2).enabled?.value).toBe(false);
+      expect(String(propsOf(1).type?.value)).toBe("separator");
+      expect(String(propsOf(3)["children-display"]?.value)).toBe("submenu");
+      expect(String(propsOf(5)["children-display"]?.value)).toBe("submenu");
+
+      // Submenus fetch by id: three prompts, then the debug rows.
+      const promptRoot = await menu.GetLayout(4, -1, []).then(([, node]) => node);
+      expect([0, 1, 2].map((i) => childNode(promptRoot, i)[0])).toEqual([5, 6, 7]);
+      expect(String(childNode(promptRoot, 0)[1].label?.value)).toBe("Commit the changes with a clear message");
+      const debugRoot = await menu.GetLayout(9, -1, []).then(([, node]) => node);
+      const debugIds = [0, 1, 2, 3].map((i) => childNode(debugRoot, i)[0]);
+      expect(debugIds).toEqual([10, 11, 12, 13]);
+      // Debug rows are disabled labels; the version row names the package and
+      // the watcher row reflects the (already successful) registration.
+      expect(childNode(debugRoot, 0)[1].enabled?.value).toBe(false);
+      expect(String(childNode(debugRoot, 0)[1].label?.value)).toMatch(/^omp-tray-ext v/);
+      expect(String(childNode(debugRoot, 3)[1].label?.value)).toBe("watcher: registered");
+
+      // Depth semantics: depth 0 lists no children; propertyNames filters.
+      const shallow = await menu.GetLayout(0, 0, []).then(([, node]) => node);
+      expect(shallow[2].length).toBe(0);
+      const filtered = await menu.GetLayout(0, 1, ["label"]).then(([, node]) => node);
+      expect(Object.keys(childNode(filtered, 0)[1])).toEqual(["label"]);
+
+      // GetGroupProperties mirrors propsFor; AboutToShow is always false.
+      const group = await menu.GetGroupProperties([1, 3], []);
+      expect(group.map(([id]) => id)).toEqual([1, 3]);
+      expect(String(group[0]?.[1].label?.value)).toBe("omp — Idle");
+      expect(await menu.AboutToShow(0)).toBe(false);
+
+      // The run comes up: the header gains the detail, Interrupt enables, and
+      // the property updates reach cached clients (with the tooltip along).
+      const updates: unknown[][] = [];
+      menuObj
+        .getInterface<{ on(event: "ItemsPropertiesUpdated", handler: (...args: unknown[]) => void): unknown } & dbus.ClientInterface>(DBUSMENU_IFACE)
+        .on("ItemsPropertiesUpdated", (...args: unknown[]) => updates.push(args));
+      const control = await client.getProxyObject(DAEMON_NAME, DAEMON_PATH);
+      const ctl = control.getInterface<DaemonControlIface & dbus.ClientInterface>(DAEMON_IFACE);
+      await ctl.SetState("working");
+      await ctl.SetDetail("Edit");
+      await waitFor(() => updates.length >= 1, 2000, 10);
+
+      const liveRoot = await menu.GetLayout(0, -1, []).then(([, node]) => node);
+      expect(String(childNode(liveRoot, 0)[1].label?.value)).toBe("omp — Working · Edit");
+      expect(childNode(liveRoot, 2)[1].enabled?.value).toBe(true);
+      const item = await client.getProxyObject(service, "/StatusNotifierItem");
+      const props = item.getInterface<PropsIface & dbus.ClientInterface>("org.freedesktop.DBus.Properties");
+      const all = (await props.GetAll("org.kde.StatusNotifierItem")) as Record<string, dbus.Variant>;
+      expect(String((all.ToolTip?.value as unknown[])[3])).toBe("Working · Edit");
+    } finally {
+      await cleanup(children, [watcherConn, client], busd);
+    }
+  },
+  15_000,
+);
+
+// ---- Menu action routing pins ----------------------------------------------
+
+test.skipIf(!Bun.which("dbus-daemon"))(
+  "menu clicks route over SessionAction; junk is ignored; Stop exits the daemon",
+  async () => {
+    const { addr, busd, watcher, watcherConn, children } = await startRegisteredDaemon();
+    const client = dbus.sessionBus({ busAddress: addr });
+    try {
+      const service = watcher.registrations[0] ?? "";
+      const menuObj = await client.getProxyObject(service, "/MenuBar");
+      const menu = menuObj.getInterface<DaemonMenuIface & dbus.ClientInterface>(DBUSMENU_IFACE);
+      const controlObj = await client.getProxyObject(DAEMON_NAME, DAEMON_PATH);
+      const control = controlObj.getInterface<DaemonControlWithActions & dbus.ClientInterface>(DAEMON_IFACE);
+
+      const actions: [string, string][] = [];
+      control.on("SessionAction", (action, arg) => actions.push([action, arg]));
+
+      // The prompt arg must be the layout label verbatim (single source of
+      // truth for the quick-prompt texts).
+      const promptRoot = await menu.GetLayout(4, -1, []).then(([, node]) => node);
+      const commitLabel = String(childNode(promptRoot, 0)[1].label?.value);
+
+      const click = (id: number, eventId = "clicked") =>
+        menu.Event(id, eventId, new dbus.Variant("s", ""), 1234);
+
+      await click(5); // Commit the changes…
+      await waitFor(() => actions.length >= 1, 2000, 10);
+      expect(actions[0]).toEqual(["prompt", commitLabel]);
+
+      // Interrupt click.
+      const ctl = controlObj.getInterface<DaemonControlIface & dbus.ClientInterface>(DAEMON_IFACE);
+      await ctl.SetState("working");
+      await click(3);
+      await waitFor(() => actions.length >= 2, 2000, 10);
+      expect(actions[1]).toEqual(["abort", ""]);
+
+      // Junk is inert: unknown id, header, separator, non-clicked event.
+      const before = actions.length;
+      await click(999);
+      await click(1);
+      await click(2);
+      await click(5, "opened");
+      await Bun.sleep(300);
+      expect(actions.length).toBe(before);
+
+      // Stop daemon exits the daemon process — revival is the extension's
+      // session-driven self-heal, never a daemon-side respawn.
+      await click(14);
+      const child = children[0];
+      const exited = await Promise.race([
+        child?.exited.then(() => true) ?? Promise.resolve(false),
+        Bun.sleep(4000).then(() => false),
+      ]);
+      expect(exited).toBe(true);
     } finally {
       await cleanup(children, [watcherConn, client], busd);
     }

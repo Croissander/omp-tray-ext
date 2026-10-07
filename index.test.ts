@@ -27,6 +27,11 @@ test("allows the host binary when the host is bun", () => {
 const bunMut = Bun as unknown as { spawn: unknown };
 const realSpawn = Bun.spawn;
 
+// Every SessionAction subscription ever made in this file. The action
+// listener is a process-wide singleton — the single-flight route pin below
+// asserts the TOTAL count, so the recorder must be file-level, not per-test.
+const sessionActionSubscriptions: ((action: string, arg: string) => void)[] = [];
+
 afterEach(() => {
   __setSessionBusForTests(null);
   bunMut.spawn = realSpawn;
@@ -38,6 +43,8 @@ afterEach(() => {
  * throw to model the daemon dying mid-call), `stopFails` rejects the Stop()
  * RPC so stopDaemon() resolves false. A SetState while `alive` is false is
  * lost at the transport: rejected before the observer — never recorded.
+ * `onSessionAction` registers every SessionAction subscription so tests can
+ * fire menu clicks; `onSetDetail` observes the run-detail RPC.
  */
 function fakeBus(opts: {
   alive?: () => boolean;
@@ -45,8 +52,10 @@ function fakeBus(opts: {
    *  this process — owner-bound, never orphaned. */
   ownerPid?: number;
   onSetState?: (state: string) => void;
+  onSetDetail?: (detail: string) => void;
   onStop?: () => void;
   stopFails?: boolean;
+  onSessionAction?: (handler: (action: string, arg: string) => void) => void;
 }) {
   const methods = {
     NameHasOwner: () => Promise.resolve(opts.alive?.() ?? true),
@@ -60,10 +69,24 @@ function fakeBus(opts: {
       opts.onSetState?.(state);
       return Promise.resolve();
     },
+    SetDetail: (detail: string) => {
+      opts.onSetDetail?.(detail);
+      return Promise.resolve();
+    },
     Stop: () => {
       if (opts.stopFails) return Promise.reject(new Error("stop failed"));
       opts.onStop?.();
       return Promise.resolve();
+    },
+    // The action listener's control-interface signal subscription. Every
+    // subscription in the file lands in one shared array: the listener is a
+    // PROCESS-wide singleton (module-level flag), so the total count across
+    // all activations is what the single-flight pin asserts.
+    on: (event: string, handler: (action: string, arg: string) => void) => {
+      if (event === "SessionAction") {
+        sessionActionSubscriptions.push(handler);
+        opts.onSessionAction?.(handler);
+      }
     },
   };
   return {
@@ -86,10 +109,12 @@ interface StubCtx {
 
 /** Minimal ExtensionAPI double: captures handlers/commands per activation. */
 function stubPi() {
-  const events = new Map<string, (event?: unknown) => unknown>();
+  const events = new Map<string, (event?: unknown, ctx?: unknown) => unknown>();
   const commands = new Map<string, { handler: (args: string, ctx: StubCtx) => Promise<void> }>();
+  const userMessages: string[] = [];
+  const warnings: string[] = [];
   const api = {
-    on: (event: string, handler: (event?: unknown) => unknown) => {
+    on: (event: string, handler: (event?: unknown, ctx?: unknown) => unknown) => {
       events.set(event, handler);
     },
     registerCommand: (
@@ -98,8 +123,17 @@ function stubPi() {
     ) => {
       commands.set(name, spec);
     },
+    sendUserMessage: (content: string) => {
+      userMessages.push(content);
+    },
+    logger: {
+      warn: (message: string) => {
+        warnings.push(message);
+      },
+      info: () => {},
+    },
   } as unknown as ExtensionAPI;
-  return { api, events, commands };
+  return { api, events, commands, userMessages, warnings };
 }
 
 test("overlapping ensureDaemon calls share one spawn attempt (single-flight pin)", async () => {
@@ -328,4 +362,56 @@ test("isOwnerless: reaped parent = orphaned, live parent = owned (parse pin)", (
       throw new Error("ENOENT");
     }),
   ).toBe(true);
+});
+
+test("menu actions route to the newest activation; one listener per process (single-flight route pin)", async () => {
+  // This test runs LAST in the file and must stay last: the action listener
+  // is a process-wide singleton started by the FIRST ompTray() above, so the
+  // pin asserts the file-wide total (every activation in this file joined
+  // exactly one subscription) and routes through that one live subscription.
+  __setSessionBusForTests(
+    () => fakeBus({}) as unknown as MessageBus,
+  );
+
+  // Two more factory rebindings (omp does this per subagent session WITHOUT
+  // re-evaluating the module): still exactly ONE listener, and the ROUTE
+  // points at the newest activation.
+  const first = stubPi();
+  const second = stubPi();
+  ompTray(first.api);
+  ompTray(second.api);
+  const tick = Promise.withResolvers<void>();
+  setTimeout(tick.resolve, 10);
+  await tick.promise;
+  expect(sessionActionSubscriptions.length).toBe(1);
+
+  const deliver = sessionActionSubscriptions[0];
+  expect(deliver).toBeDefined();
+
+  // abort → the newest activation's controller interrupt (ctx captured by
+  // ITS agent_start), not the first one's.
+  const aborts: number[] = [];
+  const secondAborted = Promise.withResolvers<void>();
+  await first.events.get("agent_start")?.({}, { abort: () => aborts.push(1) });
+  await second.events.get("agent_start")?.({}, {
+    abort: () => {
+      aborts.push(2);
+      secondAborted.resolve();
+    },
+  });
+  deliver?.("abort", "");
+  await secondAborted.promise;
+  expect(aborts).toEqual([2]);
+
+  // prompt → the newest activation's pi.sendUserMessage, verbatim.
+  deliver?.("prompt", "Run the tests and fix any failures");
+  expect(second.userMessages).toEqual(["Run the tests and fix any failures"]);
+  expect(first.userMessages).toEqual([]);
+
+  // Empty-arg prompts and unknown kinds are dropped.
+  deliver?.("prompt", "");
+  deliver?.("gibberish", "x");
+  await tick.promise;
+  expect(second.userMessages).toEqual(["Run the tests and fix any failures"]);
+  expect(second.warnings.some((w) => w.includes("gibberish"))).toBe(true);
 });

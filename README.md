@@ -1,8 +1,9 @@
 # omp-tray-ext
 
 A native Linux status-bar tray for [Oh My Pi (omp)](https://omp.sh)
-that reflects agent state — idle, working, or errored. The tray icon appears
-when omp starts and is removed when omp exits — even on a hard kill.
+that reflects agent state — idle, working, or errored — and takes quick
+actions on the agent. The tray icon appears when omp starts and is removed
+when omp exits — even on a hard kill.
 
 It implements the freedesktop **StatusNotifierItem (SNI)** spec over the DBus
 session bus, so any SNA-compatible panel renders a real tray icon with zero GUI
@@ -44,6 +45,40 @@ the pre-error state.
 
 The spinner animates at ~8 fps while the agent is working — each frame is a
 ring with a ~90° arc gap, rotated 45° per frame.
+
+## Right-click menu
+
+Right-clicking the icon opens a real menu (the `com.canonical.dbusmenu`
+exported at `/MenuBar` — the same mechanism GNOME/Plasma/waybar use for every
+SNI app). GNOME's AppIndicator extension also opens it on left-click; on
+Plasma the menu is right-click only.
+
+```
+omp — Working · Edit          state at a glance (greyed-out, live)
+──────────────────────
+Interrupt agent               abort the running turn (enabled while working)
+Prompts ▸                     send a follow-up prompt to the agent
+    Commit the changes with a clear message
+    Run the tests and fix any failures
+    Summarize what you changed in this session
+──────────────────────
+Debug ▸                       daemon facts (disabled rows)
+    omp-tray-ext v1.4.0
+    started 14:32
+    owner pid 4242
+    watcher: registered
+Stop daemon                   exit the daemon (revives on the next session
+                              event or state send — see Architecture)
+```
+
+The header line tracks the agent: the tool it is currently running
+(`tool_execution_start.toolName`) rides along with the state, so the menu
+answers "what is it doing right now" the way the dedicated session-monitors
+do. Prompt items are delivered to omp as if you had typed them — idle
+sessions start a turn, a running agent receives them as steer. Menu actions
+flow from the daemon to the extension over the `org.omptray.Daemon`
+`SessionAction` signal; the extension is the only subscriber (the bus matches
+the signal sender against the daemon's exclusive name).
 
 ## Usage
 
@@ -96,10 +131,12 @@ shows up when the daemon starts before the panel does.
 ```
 omp process (transient)          tray daemon (tied to omp lifetime)
 ┌─────────────────┐              ┌──────────────────────┐
-│ index.ts        │  SetState(s)  │ daemon.ts            │
+│ index.ts        │ SetState(s)  │ daemon.ts            │
 │  spawn daemon   │──── DBus ────▶│  owns SNI on bus     │
-│  forward events │              │  spinner timer       │
+│  forward events │ SetDetail(s) │  spinner timer       │
 │  /tray command  │              │  IconPixmap (ARGB)   │
+│  menu actions   │◀─── DBus ────│  dbusmenu /MenuBar   │
+│                 │ SessionAction│                      │
 └─────────────────┘              └──────────┬───────────┘
                                             ▼
                                  KDE / GNOME / waybar panel
@@ -110,21 +147,25 @@ omp process (transient)          tray daemon (tied to omp lifetime)
   the daemon detached, forwards turn events, respawns + reseeds on a failed
   send (the reseed runs even when the respawn fails — the daemon may appear
   moments later, and the forced reseed retries the lost final idle),
-  registers the `/tray` command, and kills the spawned daemon at process exit
-  (clean exits only — every other death mode is the daemon's own watchdog's
-  job).
-- `daemon.ts` — owns the SNI item + `org.omptray.Daemon` control interface
-  (exclusive name slot — a competing daemon exits cleanly, no name stealing);
-  re-registers with a (re)appearing StatusNotifierWatcher; renders the
-  spinner and responds to `SetState`/`Stop`; shuts itself down when its
-  owning app dies.
+  registers the `/tray` command, routes tray-menu actions (abort → interrupt,
+  prompt → `sendUserMessage`) through ONE process-wide action listener, and
+  kills the spawned daemon at process exit (clean exits only — every other
+  death mode is the daemon's own watchdog's job).
+- `daemon.ts` — owns the SNI item, the right-click dbusmenu at `/MenuBar`,
+  and the `org.omptray.Daemon` control interface (exclusive name slot — a
+  competing daemon exits cleanly, no name stealing); re-registers with a
+  (re)appearing StatusNotifierWatcher; renders the spinner and responds to
+  `SetState`/`SetDetail`/`Stop`; pushes menu actions to the extension as
+  `SessionAction` signals; shuts itself down when its owning app dies.
 - `ipc.ts` — shared DBus client: `daemonAlive`, `daemonProcessPid`,
-  `sendState`, `stopDaemon`.
+  `sendState`, `stopDaemon`, plus `watchSessionActions` (the extension's
+  persistent menu-action subscription with reconnect + liveness probe).
 - `controller.ts` — maps omp events to `idle`/`working`/`error`, turn-windowed
-  (see States); `attach()` maps run and session-lifecycle events (when a
-  mid-turn switch swallows `agent_end`, `session_before_switch`/
-  `session_switch`/`session_shutdown` are the run window's only idle close) —
-  `session_start` is owned by `index.ts`.
+  (see States); captures the run's ctx for the tray "Interrupt agent" action
+  and the current tool name as run detail; `attach()` maps run and
+  session-lifecycle events (when a mid-turn switch swallows `agent_end`,
+  `session_before_switch`/`session_switch`/`session_shutdown` are the run
+  window's only idle close) — `session_start` is owned by `index.ts`.
 - `icons.ts` — monochrome glyphs: `>` chevron + `_`, `X` (crossed strokes), 8 spinner frames.
 
 ## Install
@@ -185,7 +226,7 @@ imports the TypeScript directly via Bun.
 ```bash
 bun install          # one-time; dbus-next only
 bunx tsc --noEmit    # typecheck (strict)
-bun test             # full suite (5 files / 57 tests)
+bun test             # full suite (5 files / 65 tests)
 bun test index.test.ts
 bun test controller.test.ts
 bun test icons.test.ts
@@ -216,3 +257,12 @@ policy (bump + tag + push — tags are what `omp install` keys on).
   stealing): a competing daemon start exits cleanly and the running daemon
   keeps the icon. Per-instance icons are the upgrade path if interleaving
   becomes a problem.
+- **Menu quick-actions target the newest omp session.** The shared daemon
+  routes `SessionAction` to the extension that subscribed last (and
+  `interrupt` aborts that session's newest run). A single-session workflow is
+  the intended shape; per-session menus ride the per-instance-icon upgrade
+  path.
+- **The menu cannot approve permission prompts or focus your terminal.**
+  Approving omp approvals from the tray and window focusing (a Wayland
+  client cannot raise another window) are the natural next steps, gated on
+  deeper omp permission plumbing / a window-manager helper.

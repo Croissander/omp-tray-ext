@@ -35,6 +35,64 @@ const SPINNER_INTERVAL_MS = 120;
 const CALL_TIMEOUT_MS = 3000;
 const PROBE_INTERVAL_MS = 30_000;
 
+/** State → human label shared by the menu header and nothing else. */
+const STATE_LABEL: Record<DaemonState, string> = { idle: "Idle", working: "Working", error: "Error" };
+
+// ---- Right-click menu (com.canonical.dbusmenu) ------------------------------
+//
+// Menu item ids — a STATIC tree: ids never change, so clients can cache them
+// and live values (header label, Interrupt enabled, watcher row) ride
+// ItemsPropertiesUpdated property updates instead of layout churn. The layout
+// revision therefore never moves.
+const M_HEADER = 1;
+const M_SEP_TOP = 2;
+const M_INTERRUPT = 3;
+const M_PROMPTS = 4;
+const M_PROMPT_COMMIT = 5;
+const M_PROMPT_TESTS = 6;
+const M_PROMPT_SUMMARY = 7;
+const M_SEP_BOTTOM = 8;
+const M_DEBUG = 9;
+const M_DEBUG_VERSION = 10;
+const M_DEBUG_STARTED = 11;
+const M_DEBUG_OWNER = 12;
+const M_DEBUG_WATCHER = 13;
+const M_STOP = 14;
+
+/** Quick prompts the menu offers; the text is the verbatim user message. */
+const PROMPT_ITEMS: [number, string][] = [
+  [M_PROMPT_COMMIT, "Commit the changes with a clear message"],
+  [M_PROMPT_TESTS, "Run the tests and fix any failures"],
+  [M_PROMPT_SUMMARY, "Summarize what you changed in this session"],
+];
+
+/** Static menu tree: id → children (root 0 first). */
+const MENU_TREE: Record<number, number[]> = {
+  0: [M_HEADER, M_SEP_TOP, M_INTERRUPT, M_PROMPTS, M_SEP_BOTTOM, M_DEBUG, M_STOP],
+  [M_PROMPTS]: PROMPT_ITEMS.map(([id]) => id),
+  [M_DEBUG]: [M_DEBUG_VERSION, M_DEBUG_STARTED, M_DEBUG_OWNER, M_DEBUG_WATCHER],
+};
+
+const LAYOUT_REVISION = 1;
+
+type MenuProps = Record<string, dbus.Variant>;
+
+const svar = (value: string): dbus.Variant => new dbus.Variant("s", value);
+const bvar = (value: boolean): dbus.Variant => new dbus.Variant("b", value);
+const infoRow = (label: string): MenuProps => ({ label: svar(label), enabled: bvar(false) });
+
+const hhmm = (at: Date): string =>
+  `${String(at.getHours()).padStart(2, "0")}:${String(at.getMinutes()).padStart(2, "0")}`;
+
+function filterProps(props: MenuProps, names: string[]): MenuProps {
+  if (names.length === 0) return props;
+  const out: MenuProps = {};
+  for (const name of names) {
+    if (Object.hasOwn(props, name)) out[name] = props[name]!;
+  }
+  return out;
+}
+
 const pixmapCache = new WeakMap<Pixels, [number, number, Uint8Array]>();
 function pixmapOf(px: Pixels): [number, number, Uint8Array][] {
   let entry = pixmapCache.get(px);
@@ -50,7 +108,9 @@ class OmpTrayItem extends iface.Interface {
   Id = "omp-agent";
   Title = "omp";
   Category = "ApplicationStatus"; // waybar drops items with an empty Category
-  ItemIsMenu = false;
+  // True: /MenuBar serves a real dbusmenu now — this flag is how hosts hint
+  // "menu available" (and e.g. GNOME opens it on left-click too).
+  ItemIsMenu = true;
   Menu = "/MenuBar";
   Status = "Passive";
   ToolIconName = "";
@@ -113,9 +173,11 @@ OmpTrayItem.configureMembers({
 });
 
 /**
- * Minimal com.canonical.dbusmenu at /MenuBar. GNOME requires a live Menu
- * path to show the icon at all (a dead path churns its DBusMenu client).
- * No menu items — the tray is a status display.
+ * com.canonical.dbusmenu at /MenuBar — the right-click context menu: hosts
+ * fetch GetLayout and deliver clicks as Event("clicked"). (A live Menu path
+ * is also what GNOME requires to show the icon at all.) The item tree is
+ * static; dynamic values (header label, Interrupt enabled, watcher row) ride
+ * ItemsPropertiesUpdated, so the layout revision never moves.
  */
 class OmpTrayMenu extends iface.Interface {
   Version = 3;
@@ -123,30 +185,123 @@ class OmpTrayMenu extends iface.Interface {
   Status = "normal";
   IconThemePath: string[] = [];
   Theme: string[] = [];
-  constructor() {
+  constructor(private d: Daemon) {
     super(DBUSMENU_IFACE);
   }
 
-  /** Revision 1 and one empty root node (id 0, no props, no children). */
-  GetLayout(_parentId: number, _recursionDepth: number, _propertyNames: string[]): [number, [number, Record<string, dbus.Variant>, dbus.Variant[]]] {
-    return [1, [0, {}, []]];
+  private propsFor(id: number): MenuProps {
+    const d = this.d;
+    switch (id) {
+      case M_HEADER:
+        // Informational row — disabled so hosts render it as a label.
+        return { label: svar(d.headerLabel()), enabled: bvar(false) };
+      case M_INTERRUPT:
+        return { label: svar("Interrupt agent"), enabled: bvar(d.state === "working") };
+      case M_PROMPTS:
+        return { label: svar("Prompts"), "children-display": svar("submenu") };
+      case M_DEBUG:
+        return { label: svar("Debug"), "children-display": svar("submenu") };
+      case M_STOP:
+        return { label: svar("Stop daemon") };
+      case M_SEP_TOP:
+      case M_SEP_BOTTOM:
+        return { type: svar("separator") };
+      case M_DEBUG_VERSION:
+        return infoRow(`omp-tray-ext v${d.version}`);
+      case M_DEBUG_STARTED:
+        return infoRow(`started ${hhmm(d.startedAt)}`);
+      case M_DEBUG_OWNER:
+        return infoRow(`owner pid ${d.ownerPid}`);
+      case M_DEBUG_WATCHER:
+        return infoRow(d.watcherRegistered ? "watcher: registered" : "watcher: not registered");
+      default: {
+        const prompt = PROMPT_ITEMS.find(([pid]) => pid === id);
+        return prompt ? { label: svar(prompt[1] ?? "") } : {};
+      }
+    }
   }
-  GetGroupProperties(_ids: number[], _propertyNames: string[]): [number, Record<string, dbus.Variant>][] {
-    return [];
+
+  /**
+   * Layout node is (ia{sv}av) — (id, properties, children) — matching every
+   * real client's reply type. Honors the libdbusmenu depth semantics:
+   * 0 = the parent only, N = N levels of children, -1 = full recursion (what
+   * real hosts ask for). propertyNames filters the returned properties; []
+   * means all. The ticket's "k" timestamp code is not a D-Bus type: it is u,
+   * as in every real implementation.
+   */
+  GetLayout(parentId: number, recursionDepth: number, propertyNames: string[]): [number, [number, MenuProps, dbus.Variant[]]] {
+    const node = (id: number, depth: number): [number, MenuProps, dbus.Variant[]] => [
+      id,
+      filterProps(this.propsFor(id), propertyNames),
+      depth === 0
+        ? []
+        : (MENU_TREE[id] ?? []).map((child) => new dbus.Variant("(ia{sv}av)", node(child, depth < 0 ? depth : depth - 1))),
+    ];
+    return [LAYOUT_REVISION, node(parentId, recursionDepth)];
   }
-  GetProperty(_id: number, _name: string): dbus.Variant {
-    return new dbus.Variant("s", "");
+
+  GetGroupProperties(ids: number[], propertyNames: string[]): [number, MenuProps][] {
+    return ids.map((id) => [id, filterProps(this.propsFor(id), propertyNames)]);
   }
-  Event(_id: number, _eventId: string, _timestamp: number, _data: dbus.Variant) {}
-  EventGroup(_events: [number, string, number, dbus.Variant][]): number[] {
-    return [];
+
+  GetProperty(id: number, name: string): dbus.Variant {
+    return this.propsFor(id)[name] ?? svar("");
   }
-  AboutToShow(_id: number): boolean {
+
+  /** Route one "clicked" event; false when the id/event is not an action. */
+  private dispatch(id: number, eventId: string): boolean {
+    if (eventId !== "clicked") return false;
+    // Trust boundary: only known ids do anything — header, separators,
+    // submenus and unknown ids are inert.
+    const prompt = PROMPT_ITEMS.find(([pid]) => pid === id);
+    if (prompt) {
+      this.d.requestAction("prompt", prompt[1] ?? "");
+      return true;
+    }
+    if (id === M_INTERRUPT) {
+      this.d.requestAction("abort", "");
+      return true;
+    }
+    if (id === M_STOP) {
+      this.d.requestStop();
+      return true;
+    }
     return false;
   }
+
+  Event(id: number, eventId: string, _data: dbus.Variant, _timestamp: number) {
+    this.dispatch(id, eventId);
+  }
+
+  // Canonical events are (u,s,v,u) — id typed u here but i in Event. Weird,
+  // but both real implementations agree.
+  EventGroup(events: [number, string, dbus.Variant, number][]): number[] {
+    return events.filter(([id, eventId]) => this.dispatch(id, eventId)).map(([id]) => id);
+  }
+
+  AboutToShow(_id: number): boolean {
+    // False: the layout never changes, and dynamic values are pushed via
+    // ItemsPropertiesUpdated the moment they change.
+    return false;
+  }
+
   AboutToShowGroup(ids: number[]): [number, boolean][] {
     return ids.map((id): [number, boolean] => [id, false]);
   }
+
+  /** Emit ItemsPropertiesUpdated to cached clients (header label, enabled, watcher row). */
+  pushProperties(updated: [number, MenuProps][]) {
+    this.ItemsPropertiesUpdated(updated, []);
+  }
+
+  ItemsPropertiesUpdated(updated: [number, MenuProps][], removed: [number, string[]][]): [[number, MenuProps][], [number, string[]][]] {
+    return [updated, removed];
+  }
+
+  // Declared for introspection completeness; never emitted — the item tree
+  // is static, so property changes ride ItemsPropertiesUpdated and a
+  // LayoutUpdated would only trigger pointless client refetches.
+  LayoutUpdated(_revision: number, _parentId: number) {}
 }
 
 OmpTrayMenu.configureMembers({
@@ -158,19 +313,22 @@ OmpTrayMenu.configureMembers({
     Theme: { signature: "as", access: "read" },
   },
   methods: {
-    // Layout node is (ia{sv}av) — (id, properties, children) — matching the
-    // empty root (0, {}, []) and every real client's reply type. The ticket's
-    // "k" timestamp code is not a D-Bus type: it is u, as in every real
-    // implementation.
     GetLayout: { inSignature: "iias", outSignature: "u(ia{sv}av)" },
     GetGroupProperties: { inSignature: "auas", outSignature: "a(ia{sv})" },
-    GetProperty: { inSignature: "us", outSignature: "v" },
-    Event: { inSignature: "usuv" },
+    // Canonical arg types per the KDE/libdbusmenu interface: id is i (and
+    // Event's data rides BEFORE the timestamp). The stub-era (us)/(usuv) here
+    // mismatched every conformant client's marshalling once real items
+    // existed — clicks would have been rejected on signature.
+    GetProperty: { inSignature: "is", outSignature: "v" },
+    Event: { inSignature: "isvu" },
     EventGroup: { inSignature: "a(usuv)", outSignature: "au" },
     AboutToShow: { inSignature: "i", outSignature: "b" },
     AboutToShowGroup: { inSignature: "ai", outSignature: "aib" },
   },
-  signals: {},
+  signals: {
+    ItemsPropertiesUpdated: { signature: "a(ia{sv})a(ias)" },
+    LayoutUpdated: { signature: "ui" },
+  },
 });
 
 class DaemonControl extends iface.Interface {
@@ -186,18 +344,32 @@ class DaemonControl extends iface.Interface {
     }
     this.d.setState(state);
   }
+  SetDetail(detail: string) {
+    // Trust boundary: this text lands in menu/tooltip labels — trim and clamp.
+    const clean = detail.trim().slice(0, 80);
+    this.d.setDetail(clean || null);
+  }
   Stop() {
-    // Defer shutdown so the DBus reply for Stop() is delivered before exit.
-    setImmediate(() => this.d.shutdown());
+    this.d.requestStop();
+  }
+  // daemon → extension: a menu action for the session ("abort" with an empty
+  // arg, or "prompt" carrying the verbatim prompt text). The bus only
+  // delivers this to subscribers matching sender=org.omptray.Daemon, which
+  // requires owning the name — spoofing is not possible.
+  SessionAction(action: string, arg: string): [string, string] {
+    return [action, arg];
   }
 }
 
 DaemonControl.configureMembers({
   methods: {
     SetState: { inSignature: "s" },
+    SetDetail: { inSignature: "s" },
     Stop: {},
   },
-  signals: {},
+  signals: {
+    SessionAction: { signature: "ss" },
+  },
   properties: {},
 });
 
@@ -220,6 +392,16 @@ export function stateView(state: DaemonState, frame: number): {
   return { px: glyph("prompt"), status: "Active", tooltip: "Idle", attention: false };
 }
 
+/** Version from package.json (read per-construction — importing stays side-effect-free). */
+function packageVersion(): string {
+  try {
+    const pkg = JSON.parse(readFileSync(new URL("./package.json", import.meta.url), "utf8")) as { version?: string };
+    return pkg.version ?? "?";
+  } catch {
+    return "?";
+  }
+}
+
 class Daemon {
   private bus: dbus.MessageBus | null = null;
   private item: OmpTrayItem | null = null;
@@ -228,12 +410,28 @@ class Daemon {
   private spinner: SpinnerHandle | null = null;
   private probe: SpinnerHandle | null = null;
   private frame = 0;
-  private state: DaemonState = "idle";
+  // state/detail are read by OmpTrayMenu to build item properties — they are
+  // the shared-slot truth: last-writer-wins across sessions, by design.
+  state: DaemonState = "idle";
+  detail: string | null = null;
+  watcherRegistered = false;
+  readonly startedAt = new Date();
+  readonly ownerPid: number;
+  readonly version: string;
+  // Last header label / Interrupt-enabled value pushed to menu clients, so
+  // property updates fire only on real changes.
+  private pushedHeader: string | null = null;
+  private pushedInterrupt: boolean | null = null;
   private tooltipText: string | null = null;
   private shuttingDown = false;
   private registering = false;
   private registerPending = false;
   started = false;
+
+  constructor(ownerPid: number = Number(process.argv[2]) || process.ppid) {
+    this.ownerPid = ownerPid;
+    this.version = packageVersion();
+  }
 
   /** The one place IconPixmap + ToolTip + NewIcon are built. */
   private paint(px: Pixels, tooltip: string) {
@@ -261,7 +459,7 @@ class Daemon {
   private render() {
     if (!this.item) return;
     const { px, status, tooltip, attention } = stateView(this.state, this.frame);
-    this.paint(px, tooltip);
+    this.paint(px, this.composeTooltip(tooltip));
     this.item.Status = status;
     this.item.AttentionIconPixmap = attention ? pixmapOf(px) : [];
     iface.Interface.emitPropertiesChanged(this.item, {
@@ -277,8 +475,10 @@ class Daemon {
     this.spinner = setInterval(() => {
       this.frame = (this.frame + 1) % 8;
       if (this.state === "working") {
-        // Only update the pixmap + signal; status stays "Active".
-        this.paint(spinnerFrameByIndex(this.frame), "Working");
+        // Only update the pixmap + signal; status stays "Active". The
+        // composed tooltip is constant across ticks, so paint's dedupe
+        // keeps NewToolTip quiet.
+        this.paint(spinnerFrameByIndex(this.frame), this.composeTooltip("Working"));
       }
     }, SPINNER_INTERVAL_MS);
   }
@@ -293,12 +493,69 @@ class Daemon {
   setState(state: DaemonState) {
     if (state === this.state) return;
     this.state = state;
+    if (state === "idle") {
+      // Idle header/tooltip carry no run detail.
+      this.detail = null;
+    }
     this.stopSpinner();
     if (state === "working") {
       this.frame = 0;
       this.startSpinner();
     }
     this.render();
+    this.syncMenu();
+  }
+
+  /** Menu header: "omp — Working · Edit" — state plus the run detail. */
+  headerLabel(): string {
+    const base = `omp — ${STATE_LABEL[this.state]}`;
+    return this.state === "idle" || !this.detail ? base : `${base} · ${this.detail}`;
+  }
+
+  /** Tooltip carries the run detail only while working (error stays plain). */
+  private composeTooltip(base: string): string {
+    return this.state === "working" && this.detail ? `${base} · ${this.detail}` : base;
+  }
+
+  /** Push changed menu properties (header label, Interrupt enabled) to clients. */
+  private syncMenu() {
+    const menu = this.menu;
+    if (!menu) return;
+    const updates: [number, MenuProps][] = [];
+    const label = this.headerLabel();
+    if (label !== this.pushedHeader) {
+      this.pushedHeader = label;
+      updates.push([M_HEADER, { label: svar(label) }]);
+    }
+    const interrupt = this.state === "working";
+    if (interrupt !== this.pushedInterrupt) {
+      this.pushedInterrupt = interrupt;
+      updates.push([M_INTERRUPT, { enabled: bvar(interrupt) }]);
+    }
+    if (updates.length) menu.pushProperties(updates);
+  }
+
+  /** Run detail from the extension (the current tool name) → header + tooltip. */
+  setDetail(detail: string | null) {
+    if (detail === this.detail) return;
+    this.detail = detail;
+    // Same pixmap, possibly changed text: paint's tooltip dedupe keeps quiet
+    // when the composed text did not move.
+    const { px, tooltip } = stateView(this.state, this.frame);
+    this.paint(px, this.composeTooltip(tooltip));
+    this.syncMenu();
+  }
+
+  /** Menu → extension: emit a session action on the control interface. */
+  requestAction(action: string, arg: string) {
+    this.control?.SessionAction(action, arg);
+  }
+
+  /** Shared by DaemonControl.Stop and the menu's Stop daemon item. */
+  requestStop() {
+    // Defer shutdown so the DBus reply for Stop()/the menu click is delivered
+    // before exit.
+    setImmediate(() => this.shutdown());
   }
 
   /**
@@ -330,6 +587,8 @@ class Daemon {
         })(),
         CALL_TIMEOUT_MS,
       );
+      this.watcherRegistered = true;
+      this.menu?.pushProperties([[M_DEBUG_WATCHER, { label: svar("watcher: registered") }]]);
     } catch (e) {
       console.warn("[omptray-daemon] StatusNotifierWatcher registration failed:", (e as Error).message);
     } finally {
@@ -370,7 +629,7 @@ class Daemon {
     this.bus = bus;
 
     this.item = new OmpTrayItem();
-    this.menu = new OmpTrayMenu();
+    this.menu = new OmpTrayMenu(this);
     this.control = new DaemonControl(this);
     bus.export(SNI_PATH, this.item);
     bus.export(MENU_PATH, this.menu);
@@ -531,7 +790,8 @@ export function ownerTtyNr(
 // Module import is side-effect-free (tests import stateView); daemon
 // instantiation and signal wiring happen only when run as the daemon.
 if (import.meta.main) {
-  const daemon = new Daemon();
+  const owner = Number(process.argv[2]) || process.ppid;
+  const daemon = new Daemon(owner);
   // Graceful signals: release the name so the panel removes the icon promptly.
   const die = () => daemon.shutdown();
   for (const sig of ["SIGTERM", "SIGINT", "SIGHUP"] as const) {
@@ -546,7 +806,6 @@ if (import.meta.main) {
   // process even started. Manual `bun daemon.ts` runs fall back to the
   // spawning shell — same rule, die with the shell. The check is stateless
   // (ppid never changes back), so registration order cannot miss a death.
-  const owner = Number(process.argv[2]) || process.ppid;
   if (process.ppid !== owner) process.exit(0);
   // The owner can also OUTLIVE its terminal: omp's disconnect teardown
   // sometimes hangs instead of exiting (stdin end → self-SIGHUP never

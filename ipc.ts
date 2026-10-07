@@ -17,7 +17,17 @@ export type DaemonState = "idle" | "working" | "error";
 /** Typed view over the daemon's control interface (dbus-next's is `{ [k]: Function }`). */
 export interface DaemonControlIface {
   SetState(state: string): Promise<void>;
+  SetDetail(detail: string): Promise<void>;
   Stop(): Promise<void>;
+}
+
+/**
+ * Typed view of the daemon's control interface as a SIGNAL source: menu
+ * clicks arrive here as SessionAction(action, arg) — ("abort", "") or
+ * ("prompt", verbatim prompt text).
+ */
+export interface DaemonActionSource {
+  on(event: "SessionAction", handler: (action: string, arg: string) => void): unknown;
 }
 
 /** Typed view over the org.freedesktop.DBus driver (name/owner queries). */
@@ -131,12 +141,16 @@ export async function daemonProcessPid(timeoutMs = 3000): Promise<number | null>
 }
 
 /**
- * Send a state update to the daemon. Resolves true iff the daemon accepted it;
- * false when the daemon is unreachable or the send fails — the caller decides
- * on recovery. Never blocks the agent loop on tray IPC. `timeoutMs` is ONE
- * absolute budget covering the bus connect and every RPC.
+ * Send a state update to the daemon, plus optional run detail (the current
+ * tool name — menu header/tooltip text). Resolves true iff the daemon
+ * accepted the state; false when the daemon is unreachable or the send fails
+ * — the caller decides on recovery. The detail RPC rides the SAME connection
+ * and is best-effort: a failure there (e.g. an older daemon without
+ * SetDetail) never fails the state send. Never blocks the agent loop on tray
+ * IPC. `timeoutMs` is ONE absolute budget covering the bus connect and every
+ * RPC.
  */
-export async function sendState(state: DaemonState, timeoutMs = 3000): Promise<boolean> {
+export async function sendState(state: DaemonState, detail?: string, timeoutMs = 3000): Promise<boolean> {
   const until = Date.now() + timeoutMs;
   const conn = await connectBus(budgetLeft(until));
   if (!conn.ok || !conn.bus) return false;
@@ -144,6 +158,9 @@ export async function sendState(state: DaemonState, timeoutMs = 3000): Promise<b
     const proxy = await deadline(conn.bus.getProxyObject(DAEMON_NAME, DAEMON_PATH), budgetLeft(until));
     const control = proxy.getInterface<DaemonControlIface & dbus.ClientInterface>(DAEMON_IFACE);
     await deadline(control.SetState(state), budgetLeft(until));
+    if (detail !== undefined) {
+      await deadline(control.SetDetail(detail), budgetLeft(until)).catch(() => {});
+    }
     return true;
   } catch {
     // Daemon not up yet, or vanished — caller recovers (respawn + reseed).
@@ -173,4 +190,89 @@ export async function stopDaemon(timeoutMs = 3000): Promise<boolean> {
   } finally {
     try { conn.bus.disconnect(); } catch {}
   }
+}
+
+/** Interval between liveness probes of the action-listener connection. */
+const ACTION_PROBE_INTERVAL_MS = 30_000;
+
+/**
+ * Subscribe to the daemon's menu actions. ONE persistent session-bus
+ * connection whose signal match is addressed by the well-known daemon name,
+ * so it survives daemon respawns — the bus re-resolves the name per delivery.
+ *
+ * The connection self-heals like the daemon's own link: reconnect after a
+ * bus `error`, and probe liveness every `probeMs` — pending calls never
+ * settle on a clean socket close (no event), the same dbus-next defect the
+ * daemon's self-probe exists for, so silence must be tested, not assumed.
+ *
+ * Fire-and-forget by design: never awaited from the agent flow, handler
+ * errors are warn-only. Returns a disposer that stops the loop (tests).
+ *
+ * @internal `probeMs` injectable for tests (default 30 s).
+ */
+export function watchSessionActions(
+  onAction: (action: string, arg: string) => void,
+  timeoutMs = 3000,
+  probeMs: number = ACTION_PROBE_INTERVAL_MS,
+): () => void {
+  let stopped = false;
+
+  void (async () => {
+    while (!stopped) {
+      const conn = await connectBus(timeoutMs);
+      if (stopped) {
+        try { conn.bus?.disconnect(); } catch {}
+        return;
+      }
+      if (!conn.bus) {
+        await Bun.sleep(timeoutMs);
+        continue;
+      }
+      const bus = conn.bus;
+      try {
+        const dead = Promise.withResolvers<void>();
+        bus.on("error", () => dead.resolve());
+        const proxy = await deadline(bus.getProxyObject(DAEMON_NAME, DAEMON_PATH), timeoutMs);
+        const control = proxy.getInterface<DaemonActionSource & dbus.ClientInterface>(DAEMON_IFACE);
+        control.on("SessionAction", (action, arg) => {
+          try {
+            onAction(action, arg);
+          } catch (e) {
+            console.warn("[omptray] session action handler failed:", (e as Error).message);
+          }
+        });
+        // Park until the connection dies: an explicit error event, or a
+        // failed liveness probe (NameHasOwner — `false` is a HEALTHY answer:
+        // an absent daemon is valid, the name-based match revives with it).
+        while (!stopped) {
+          const woke = await Promise.race([
+            dead.promise.then(() => "dead" as const),
+            Bun.sleep(probeMs).then(() => "tick" as const),
+          ]);
+          if (stopped || woke === "dead") break;
+          const alive = await deadline(
+            (async () => {
+              const driverProxy = await bus.getProxyObject("org.freedesktop.DBus", "/org/freedesktop/DBus");
+              const driver = driverProxy.getInterface<DriverIface & dbus.ClientInterface>("org.freedesktop.DBus");
+              await driver.NameHasOwner(DAEMON_NAME);
+            })(),
+            timeoutMs,
+          ).then(
+            () => true,
+            () => false,
+          );
+          if (!alive) break;
+        }
+      } catch {
+        // Subscribe failed (daemon absent, connect broken) — bounded pause.
+        await Bun.sleep(timeoutMs);
+      } finally {
+        try { bus.disconnect(); } catch {}
+      }
+    }
+  })();
+
+  return () => {
+    stopped = true;
+  };
 }
