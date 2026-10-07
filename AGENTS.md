@@ -54,7 +54,8 @@ omp process (transient)          tray daemon (one per session bus)
   is unowned — the adoption owner check). Also `watchSessionActions(onAction,
   timeoutMs?, probeMs?)` — the extension's persistent SessionAction
   subscription (name-addressed match survives daemon respawns; reconnect on
-  bus error + `probeMs` liveness probe against silent socket death) — and
+  bus error + `probeMs` liveness probe against silent socket death;
+  event-loop neutral — unref'd socket/timers, see ceilings) — and
   `deadline()` (shared with `daemon.ts`) plus the `__setSessionBusForTests`
   `@internal` bus-factory seam.
 - `daemon.ts` — detached process owning the SNI item (its signals are the
@@ -315,7 +316,12 @@ clicks on signature.
   session (caught + warned, `pi.sendUserMessage` throws); (g) the menu cannot
   approve permission prompts or focus/raise the terminal window (Wayland
   clients cannot raise peers) — both are the research-backed next features,
-  gated on omp permission plumbing / a WM helper.
+  gated on omp permission plumbing / a WM helper; (h) the action listener is
+  EVENT-LOOP NEUTRAL by contract — unref'd socket + unref'd park/probe
+  timers — because short-lived processes that merely load the extension
+  entry (`omp install`) would otherwise hang forever on the persistent
+  subscription (v1.4.0 regression, pinned by a child-exit test in
+  `ipc.test.ts`).
 
 ### Slash-command surface (`/tray`)
 
@@ -343,7 +349,7 @@ Flat root — no `src/`; all source, tests, and config live beside each other:
 ```bash
 bun install                       # one-time; dbus-next only
 bunx tsc --noEmit                 # typecheck (strict) — after every change
-bun test                          # full suite (5 files, 65 tests)
+bun test                          # full suite (5 files, 66 tests)
 bun test controller.test.ts       # single file (each header states its command)
 bun ./icons.ts                    # render glyphs, print pixel counts (visual check)
 ```
@@ -490,7 +496,7 @@ Authoritative: <https://omp.sh/docs/extension-authoring>,
 ## Testing & QA
 
 - Framework: **bun:test** (`import { test, expect } from "bun:test"`), flat
-  `*.test.ts` beside sources. Full suite `bun test` (65 tests / 5 files);
+  `*.test.ts` beside sources. Full suite `bun test` (66 tests / 5 files);
   each file's header comment states its single-file command.
 - `index.test.ts` pins the spawn runner and extension lifetime:
   `resolveDaemonRunner` prefers `bun` from PATH and returns `null` for a
@@ -560,9 +566,10 @@ Authoritative: <https://omp.sh/docs/extension-authoring>,
   name is unowned or the call hangs. `sendState` detail pins: the detail RPC
   rides the same connection, a detail failure never fails the send, no detail
   → only `SetState`. `watchSessionActions` pins: one persistent connection
-  delivering `SessionAction` payloads, reconnect after a bus error, and a
-  failed liveness probe (silent socket death) drops and re-subscribes — no
-  churn beyond the one recovery.
+  delivering `SessionAction` payloads, reconnect after a bus error, a failed
+  liveness probe (silent socket death) drops and re-subscribes with no churn
+  beyond the one recovery, and a child process that starts the listener exits
+  by itself (event-loop neutrality — the omp install hang regression).
 - Rule: **tests never touch the real session bus.** The documented deviation
   from "tests never touch DBus" remains `daemon.test.ts`'s private-bus
   harness: it speaks DBus, but only over a PRIVATE throwaway `dbus-daemon`

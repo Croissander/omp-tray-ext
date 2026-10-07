@@ -3,9 +3,11 @@
 // connection error, or bus death — so an unanswered RPC used to wedge the
 // extension's serialized state chain forever. These pins hold every client
 // call to its contract: always settles within the budget (connect + RPCs),
-// resolves false on failure instead of throwing, and releases the bus exactly
-// once on every path. Hermetic: duck-typed fake bus only, never a real session
-// bus (seam is restored after every test).
+// resolves false on failure instead of throwing, releases the bus exactly
+// once on every path, and keeps the action listener event-loop neutral (a
+// short-lived loader such as `omp install` must be able to exit). Hermetic:
+// duck-typed fake buses (plus one child-process exit pin) only — never a real
+// session bus (seam is restored after every test).
 // bun test ipc.test.ts
 
 import { afterEach, expect, test } from "bun:test";
@@ -348,4 +350,38 @@ test("watchSessionActions reconnects when the connection silently dies (probe pi
   } finally {
     stop();
   }
+});
+
+// --- (h) event-loop neutrality pin (the omp install hang) --------------------
+
+test("watchSessionActions never holds the event loop (a short-lived loader can exit)", async () => {
+  // The regression this pins: the persistent DBus connection and its timers
+  // once kept every short-lived process that loads the extension entry
+  // (omp install) alive forever. Observable contract: a child process that
+  // starts the listener and then simply ENDS must exit by itself — with the
+  // regression it hangs until killed and the race below flips to true.
+  const childScript = `
+    const { __setSessionBusForTests, watchSessionActions } = await import(process.cwd() + "/ipc.ts");
+    const bus = {
+      on(event, cb) { if (event === "connect") queueMicrotask(cb); },
+      disconnect() {},
+      getProxyObject: () => Promise.resolve({
+        getInterface: () => ({
+          on() {},
+          NameHasOwner: () => Promise.resolve(true),
+        }),
+      }),
+    };
+    __setSessionBusForTests(() => bus);
+    watchSessionActions(() => {}, 50, 20);
+  `;
+  const proc = Bun.spawn([Bun.which("bun") ?? "bun", "-e", childScript], {
+    cwd: import.meta.dir,
+    stdout: "ignore",
+    stderr: "pipe",
+  });
+  const hung = await Promise.race([proc.exited.then(() => false), Bun.sleep(5000).then(() => true)]);
+  if (hung) proc.kill("SIGKILL");
+  await proc.exited;
+  expect(hung).toBe(false);
 });

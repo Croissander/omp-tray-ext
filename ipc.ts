@@ -44,15 +44,28 @@ interface DriverIface {
  * `disconnect()`, connection errors, and remote bus death leave the promise
  * pending forever (no timeout machinery in the lib). Without this wrapper an
  * unanswered RPC wedges the caller's serialized state chain for good.
+ *
+ * `unrefTimer` arms the timeout unref'd — for callers that must never hold a
+ * host event loop open (the action listener in short-lived processes such as
+ * `omp install`).
  */
-export function deadline<T>(p: Promise<T>, ms: number): Promise<T> {
+export function deadline<T>(p: Promise<T>, ms: number, unrefTimer = false): Promise<T> {
   const { promise, resolve, reject } = Promise.withResolvers<T>();
   const t = setTimeout(() => reject(new Error("dbus call timeout")), ms);
+  if (unrefTimer) (t as unknown as { unref?: () => void }).unref?.();
   p.then(
     (v) => { clearTimeout(t); resolve(v); },
     (e) => { clearTimeout(t); reject(e); },
   );
   return promise;
+}
+
+/** Unref'd sleep: fires while the process lives but never keeps it alive. */
+function parkTimer(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    const t = setTimeout(resolve, ms);
+    (t as unknown as { unref?: () => void }).unref?.();
+  });
 }
 
 /** Session-bus factory `connectBus` calls; tests swap it to avoid the real bus. */
@@ -225,14 +238,14 @@ export function watchSessionActions(
         return;
       }
       if (!conn.bus) {
-        await Bun.sleep(timeoutMs);
+        await parkTimer(timeoutMs);
         continue;
       }
       const bus = conn.bus;
       try {
         const dead = Promise.withResolvers<void>();
         bus.on("error", () => dead.resolve());
-        const proxy = await deadline(bus.getProxyObject(DAEMON_NAME, DAEMON_PATH), timeoutMs);
+        const proxy = await deadline(bus.getProxyObject(DAEMON_NAME, DAEMON_PATH), timeoutMs, true);
         const control = proxy.getInterface<DaemonActionSource & dbus.ClientInterface>(DAEMON_IFACE);
         control.on("SessionAction", (action, arg) => {
           try {
@@ -241,13 +254,20 @@ export function watchSessionActions(
             console.warn("[omptray] session action handler failed:", (e as Error).message);
           }
         });
+        // Event-loop neutrality: a short-lived process that merely loads the
+        // extension entry (omp install) must be able to exit — the persistent
+        // socket and every park/probe timer are unref'd, so the subscription
+        // lives as long as the host lives but never keeps it alive.
+        try {
+          (bus as unknown as { stream?: { unref?: () => void } }).stream?.unref?.();
+        } catch {}
         // Park until the connection dies: an explicit error event, or a
         // failed liveness probe (NameHasOwner — `false` is a HEALTHY answer:
         // an absent daemon is valid, the name-based match revives with it).
         while (!stopped) {
           const woke = await Promise.race([
             dead.promise.then(() => "dead" as const),
-            Bun.sleep(probeMs).then(() => "tick" as const),
+            parkTimer(probeMs).then(() => "tick" as const),
           ]);
           if (stopped || woke === "dead") break;
           const alive = await deadline(
@@ -257,6 +277,7 @@ export function watchSessionActions(
               await driver.NameHasOwner(DAEMON_NAME);
             })(),
             timeoutMs,
+            true,
           ).then(
             () => true,
             () => false,
@@ -265,7 +286,7 @@ export function watchSessionActions(
         }
       } catch {
         // Subscribe failed (daemon absent, connect broken) — bounded pause.
-        await Bun.sleep(timeoutMs);
+        await parkTimer(timeoutMs);
       } finally {
         try { bus.disconnect(); } catch {}
       }
