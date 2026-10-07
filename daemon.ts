@@ -6,6 +6,7 @@
 // States:  idle=">_",  working=spinning ring,  error="X"
 
 import dbus from "dbus-next";
+import { readFileSync } from "node:fs";
 import { DAEMON_IFACE, DAEMON_NAME, DAEMON_PATH, deadline, type DaemonState } from "./ipc";
 import { glyph, spinnerFrameByIndex, toArgb, type Pixels } from "./icons";
 
@@ -504,6 +505,29 @@ class Daemon {
   }
 }
 
+/**
+ * The owner's controlling-terminal device from /proc/<pid>/stat (field 7,
+ * `tty_nr`), 0 when the process has no ctty, -1 when the stat read fails —
+ * an unreadable stat must never read as "no terminal", only a confirmed 0
+ * means the terminal is gone. stat is "pid (comm) state ppid pgrp session
+ * tty_nr ..."; comm may contain spaces/parens, so parsing starts after the
+ * last ")" (same shape as the extension's isOwnerless).
+ *
+ * @internal `statOf` injectable for tests.
+ */
+export function ownerTtyNr(
+  pid: number,
+  statOf: (pid: number) => string = (p) => readFileSync(`/proc/${p}/stat`, "utf8"),
+): number {
+  try {
+    const stat = statOf(pid);
+    const tty = Number(stat.slice(stat.lastIndexOf(")") + 2).split(" ")[4]);
+    return Number.isFinite(tty) && tty >= 0 ? tty : -1;
+  } catch {
+    return -1;
+  }
+}
+
 // Module import is side-effect-free (tests import stateView); daemon
 // instantiation and signal wiring happen only when run as the daemon.
 if (import.meta.main) {
@@ -524,8 +548,25 @@ if (import.meta.main) {
   // (ppid never changes back), so registration order cannot miss a death.
   const owner = Number(process.argv[2]) || process.ppid;
   if (process.ppid !== owner) process.exit(0);
+  // The owner can also OUTLIVE its terminal: omp's disconnect teardown
+  // sometimes hangs instead of exiting (stdin end → self-SIGHUP never
+  // completes; upstream oh-my-pi #5835/#6788 class), and ppid alone then
+  // never changes — the icon would track a headless zombie forever. When the
+  // terminal dies for good, the session leader dies with it and the owner's
+  // controlling terminal is released: /proc/<owner>/stat tty_nr drops to 0,
+  // readable from here even while the owner's event loop is wedged. Owners
+  // that never had a ctty (piped stdin, setsid — boot tty 0) are
+  // non-interactive by construction and keep the ppid-only rule.
+  // ponytail: a terminal dying during the ~2 s spawn window reads as
+  // non-interactive and disarms this check (ppid still covers the exit);
+  // upgrade path: the extension passes its own isTTY in argv[3].
+  const bootTty = ownerTtyNr(owner);
   setInterval(() => {
-    if (process.ppid !== owner) daemon.shutdown();
+    if (process.ppid !== owner) {
+      daemon.shutdown();
+      return;
+    }
+    if (bootTty > 0 && ownerTtyNr(owner) === 0) daemon.shutdown();
   }, 1000);
   const ok = await daemon.start();
   if (!ok) process.exit(1);

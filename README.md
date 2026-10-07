@@ -185,7 +185,7 @@ imports the TypeScript directly via Bun.
 ```bash
 bun install          # one-time; dbus-next only
 bunx tsc --noEmit    # typecheck (strict)
-bun test             # full suite (5 files / 54 tests)
+bun test             # full suite (5 files / 57 tests)
 bun test index.test.ts
 bun test controller.test.ts
 bun test icons.test.ts

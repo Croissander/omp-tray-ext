@@ -52,7 +52,8 @@ omp process (transient)          tray daemon (one per session bus)
   interface (`SetState`, `Stop`); spinner timer (8 frames @120 ms),
   `paint()`/`render()` SNI updates, watcher (re-)registration, bus self-probe,
   and the owner-liveness watchdog (exits when the owning app dies, whatever
-  the death mode).
+  the death mode, and when the owning app's terminal is gone while the app
+  lingers — see the owner-lifetime invariant).
 - `icons.ts` — pure 22×22 pixel glyphs (no font/image library): `>_` prompt,
   `X` error, 8 spinner frames; RGBA→ARGB converter.
 
@@ -147,7 +148,15 @@ TEXT changes (spinner ticks must not churn it).
   mechanism covering signal death: `process.on("exit")` never runs when the
   owner dies by signal (SIGHUP terminal close, SIGINT, SIGTERM, SIGKILL —
   verified empirically, 2026-10-06), so exit-hook-only teardown leaked the
-  daemon and its icon on every hard close (the stale-icon bug). Adoption
+  daemon and its icon on every hard close (the stale-icon bug). The same poll
+  also watches the owner's CONTROLLING TERMINAL: an owner can outlive its
+  terminal (omp's disconnect teardown hangs instead of exiting — upstream
+  #5835/#6788 class), ppid never changes, and only the released ctty
+  (`/proc/<owner>/stat` `tty_nr` → 0, read once at boot and re-checked each
+  poll) marks the app as gone for the user. A boot `tty_nr` of 0 (piped
+  stdin, setsid) is non-interactive and arms NOTHING — the tty check kills
+  only when a tty the owner HAD has gone. `-1` (unreadable stat) never reads
+  as terminal death. Adoption
   enforces the same invariant client-side: `ensureDaemon` ADOPTS only an
   owner-bound daemon (`isOwnerless` — `/proc/<pid>/stat` ppid 1 or gone) and
   REPLACES an owner-less one (`stopDaemon` + `waitGone` + spawn) — which also
@@ -231,7 +240,13 @@ TEXT changes (spinner ticks must not churn it).
   adoption — `ponytail:`-marked in `isOwnerless`, upgrade path a daemon-side
   owner-pid handshake; (c) an adopted daemon outlives a closing ADOPTER while
   its owner omp lives (shared slot, by design) — the next failed send
-  re-heals via `recover()`.
+  re-heals via `recover()`; (d) a terminal dying during the daemon's ~2 s
+  spawn window reads as non-interactive (boot `tty_nr` 0) and disarms the
+  tty check (ppid still covers the exit) — `ponytail:`-marked in
+  `daemon.ts`, upgrade path the extension passing its own `isTTY` in
+  argv[3]; (e) omp itself may still linger headless after a disconnect
+  (upstream #5835/#6788 class) — the tty watchdog only takes the ICON down
+  then; killing the zombie process is omp's to fix.
 
 ### Slash-command surface (`/tray`)
 
@@ -259,7 +274,7 @@ Flat root — no `src/`; all source, tests, and config live beside each other:
 ```bash
 bun install                       # one-time; dbus-next only
 bunx tsc --noEmit                 # typecheck (strict) — after every change
-bun test                          # full suite (5 files, 54 tests)
+bun test                          # full suite (5 files, 57 tests)
 bun test controller.test.ts       # single file (each header states its command)
 bun ./icons.ts                    # render glyphs, print pixel counts (visual check)
 ```
@@ -373,7 +388,7 @@ Authoritative: <https://omp.sh/docs/extension-authoring>,
 | `index.test.ts` | Spawn-runner resolution + extension pins (single-flight spawn, reseed-after-failed-ensure, no-suppression, shutdown-no-kill, restart failure, owner-verified adoption + `isOwnerless` parse; bun:test) |
 | `controller.test.ts` | Chain-ordering/state-machine + turn-window mapping + flash-timing pins (bun:test) |
 | `icons.test.ts` | Pixel/ARGB correctness suite (bun:test) |
-| `daemon.test.ts` | `stateView` render-mapping + hermetic lifecycle pins (slot, watcher-restart, SNI conformance, initial-state, SIGTERM-during-startup, owner-lifetime (predecease, stale-icon); bun:test) |
+| `daemon.test.ts` | `stateView` render-mapping + hermetic lifecycle pins (slot, watcher-restart, SNI conformance, initial-state, SIGTERM-during-startup, owner-lifetime (predecease, stale-icon, setsid-owner, tty-loss); bun:test) |
 | `ipc.test.ts` | `deadline` unit pins + fake-bus RPC pins (never-settle, success, disconnect-always, owner-pid probe; bun:test) |
 | `.github/workflows/ci.yml` | CI: `bun install --frozen-lockfile` + gates on push/PR |
 | `package.json` | `omp.extensions` load hook; `name` doubles as `disabledExtensions` key; `version` couples to git tag |
@@ -406,7 +421,7 @@ Authoritative: <https://omp.sh/docs/extension-authoring>,
 ## Testing & QA
 
 - Framework: **bun:test** (`import { test, expect } from "bun:test"`), flat
-  `*.test.ts` beside sources. Full suite `bun test` (54 tests / 5 files);
+  `*.test.ts` beside sources. Full suite `bun test` (57 tests / 5 files);
   each file's header comment states its single-file command.
 - `index.test.ts` pins the spawn runner and extension lifetime:
   `resolveDaemonRunner` prefers `bun` from PATH and returns `null` for a
@@ -446,7 +461,15 @@ Authoritative: <https://omp.sh/docs/extension-authoring>,
   handshake), and the owner-lifetime pins (owner-predecease: a daemon whose
   owner died before it booted exits without registering; stale-icon: a
   SIGKILLed owner takes the daemon and its names down — the icon dies with
-  its app). Self-skips when the `dbus-daemon` binary is missing.
+  its app; setsid-owner: a non-interactive owner (no ctty) boots, registers
+  and STAYS up, then still dies at a SIGKILLed owner — the tty check must not
+  arm on boot tty 0; tty-loss: an owner under `script`(1) that survives its
+  pty master being SIGKILLed (HUP-ignored) still loses the daemon and its
+  names when the ctty releases — the icon dies with the terminal, not just
+  the pid). Plus a `ownerTtyNr` parse pin (comm with parens/spaces; a
+  truncated or unreadable stat reads as -1 "unknown", never as terminal
+  death). Self-skips when the `dbus-daemon` (or, for tty-loss, `script`)
+  binary is missing.
 - `ipc.test.ts` pins `deadline()` (value passthrough, timeout error, prompt
   original rejection, timer disarmed on settle) and the client calls against a
   fake `MessageBus` (via `__setSessionBusForTests`): never-settling RPCs

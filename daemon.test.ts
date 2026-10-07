@@ -3,9 +3,10 @@
 // payload, NewToolTip only on tooltip change, publish-before-register,
 // watcher-restart re-registration, SIGTERM during startup), owner-lifetime
 // pins (the daemon dies with its owner, whatever the death mode — the
-// stale-icon fix), and the single-instance slot pin — two daemon processes
-// racing on one session bus must yield exactly one StatusNotifierWatcher
-// registration and one surviving daemon.
+// stale-icon fix; also with the owner's TERMINAL — the headless-zombie fix;
+// and stays alive for a non-interactive owner), and the single-instance slot
+// pin — two daemon processes racing on one session bus must yield exactly one
+// StatusNotifierWatcher registration and one surviving daemon.
 //
 // bun test daemon.test.ts
 
@@ -14,7 +15,7 @@ import { expect, test } from "bun:test";
 import { readFileSync, rmSync } from "node:fs";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
-import { stateView } from "./daemon";
+import { stateView, ownerTtyNr } from "./daemon";
 import { glyph, spinnerFrameByIndex } from "./icons";
 import { DAEMON_IFACE, DAEMON_NAME, DAEMON_PATH, type DaemonControlIface } from "./ipc";
 
@@ -50,6 +51,23 @@ test("idle maps to the prompt glyph", () => {
 test("frame only matters for working", () => {
   expect(stateView("idle", 5).px).toBe(glyph("prompt"));
   expect(stateView("error", 5).px).toBe(glyph("error"));
+});
+
+test("ownerTtyNr parses tty_nr from stat and never reads a bad stat as terminal-death", () => {
+  const statOf = (stat: string) => () => stat;
+  // stat is "pid (comm) state ppid pgrp session tty_nr ..."; field 7 is the
+  // ctty device, 0 = none. comm may contain spaces/parens.
+  expect(ownerTtyNr(1, statOf("1 (systemd) S 0 1 1 0 -1 4194560"))).toBe(0);
+  expect(ownerTtyNr(2, statOf("2 (kworker/0:1) S 0 1 1 34817 3897"))).toBe(34817);
+  expect(ownerTtyNr(3, statOf("3 (a b (c)) S 0 1 1 34816 3924"))).toBe(34816);
+  // Truncated or unreadable stat = unknown, NOT "no ctty" (only a confirmed
+  // 0 may kill the daemon).
+  expect(ownerTtyNr(4, statOf("4 (gone) S 0"))).toBe(-1);
+  expect(
+    ownerTtyNr(5, () => {
+      throw new Error("EACCES");
+    }),
+  ).toBe(-1);
 });
 
 // ---- Hermetic private-bus harness ------------------------------------------
@@ -478,4 +496,200 @@ test.skipIf(!Bun.which("dbus-daemon"))(
     }
   },
   15_000,
+);
+
+// ---- Owner-terminal pins (the headless-zombie fix) --------------------------
+//
+// The icon must also disappear when the owner OUTLIVES its terminal: omp's
+// disconnect teardown sometimes hangs instead of exiting (upstream #5835 /
+// #6788 class), ppid never changes, and the pre-tty-watch daemon tracked the
+// headless zombie forever. The daemon reads the owner's controlling terminal
+// from /proc/<owner>/stat (tty_nr): a boot tty of 0 (piped stdin, setsid) is
+// non-interactive and must NOT arm the check; a released tty (0 later) must
+// kill the daemon even though the owner process is still alive.
+
+// Shared owner stand-in source: spawns the daemon exactly like index.ts
+// (owner pid in argv[2], detached) and prints "<ownerPid> <daemonPid>" so the
+// test can watch both the way the daemon does.
+function ownerSource(addr: string, runner: string): string {
+  return [
+    `const proc = Bun.spawn([${JSON.stringify(runner)}, "daemon.ts", String(process.pid)], {`,
+    `  cwd: ${JSON.stringify(import.meta.dir)},`,
+    `  env: { ...process.env, DBUS_SESSION_BUS_ADDRESS: ${JSON.stringify(addr)} },`,
+    `  stdio: ["ignore", "ignore", "ignore"],`,
+    `  detached: true,`,
+    `});`,
+    `proc.unref();`,
+    `console.log(process.pid + " " + proc.pid);`,
+    `setInterval(() => {}, 1000);`,
+  ].join("\n");
+}
+
+/** Read "<ownerPid> <daemonPid>" from a child's stdout with a hard bound. */
+async function readOwnerDaemonPids(child: Child): Promise<[number, number]> {
+  const reader = child.stdout.getReader();
+  const decoder = new TextDecoder();
+  let printed = "";
+  while (!printed.includes("\n")) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    if (value) printed += decoder.decode(value, { stream: true });
+  }
+  void reader.cancel();
+  const [ownerStr, daemonStr] = printed.trim().split(" ");
+  const ownerPid = Number(ownerStr);
+  const daemonPid = Number(daemonStr);
+  expect(Number.isInteger(ownerPid) && ownerPid > 0).toBe(true);
+  expect(Number.isInteger(daemonPid) && daemonPid > 0).toBe(true);
+  return [ownerPid, daemonPid];
+}
+
+// A zombie counts as gone: it is a dead process (connection closed, names
+// released) merely awaiting a reap — from init, or from us if bun test
+// happens to be a subreaper.
+function deadOrZombie(pid: number): boolean {
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+    return stat.slice(stat.lastIndexOf(")") + 2).startsWith("Z");
+  } catch {
+    return true;
+  }
+}
+
+test.skipIf(!Bun.which("dbus-daemon"))(
+  "a non-interactive owner (no ctty) does not arm the tty check (setsid-owner pin)",
+  async () => {
+    const { busd, addr, watcher, watcherConn } = await startWatchedBus();
+    const runner = Bun.which("bun") ?? "bun";
+    // detached: true = setsid — the owner gets its own session and no ctty,
+    // the same /proc shape as a piped (non-interactive) omp run.
+    const owner = Bun.spawn([runner, "-e", ownerSource(addr, runner)], {
+      cwd: import.meta.dir,
+      stdio: ["ignore", "pipe", "pipe"],
+      detached: true,
+    });
+    try {
+      const [ownerPid, daemonPid] = await readOwnerDaemonPids(owner);
+      expect(ownerTtyNr(ownerPid)).toBe(0); // precondition: really no ctty
+
+      // The daemon boots and shows the icon: registration is what "up" means.
+      await waitFor(() => watcher.registrations.length >= 1, 4000, 5);
+      expect(watcher.registrations.length).toBe(1);
+
+      // And it STAYS up: a wrongly-armed tty check (boot tty 0 misread as a
+      // dead terminal) would kill it within a poll or two. Real-time quiet
+      // period — the daemon's clock cannot be driven by fake timers.
+      await Bun.sleep(2500);
+      expect(watcher.registrations.length).toBe(1);
+      expect(deadOrZombie(daemonPid)).toBe(false);
+
+      // The ppid rule still applies to this owner: SIGKILL takes the daemon.
+      owner.kill("SIGKILL");
+      await Promise.race([owner.exited, Bun.sleep(2000)]);
+      await waitFor(() => deadOrZombie(daemonPid), 4000, 50);
+      expect(deadOrZombie(daemonPid)).toBe(true);
+    } finally {
+      try {
+        owner.kill("SIGKILL");
+      } catch {}
+      await cleanup([], [watcherConn], busd);
+    }
+  },
+  15_000,
+);
+
+test.skipIf(!Bun.which("dbus-daemon") || !Bun.which("script"))(
+  "a released controlling terminal takes the daemon down even with the owner alive (tty-loss pin)",
+  async () => {
+    const { busd, addr, watcher, watcherConn } = await startWatchedBus();
+    const runner = Bun.which("bun") ?? "bun";
+    // script(1) gives the owner a real pty: it forks a child that setsid()s,
+    // claims the slave as its ctty and execs the command. `trap "" HUP` sets
+    // SIG_IGN, which survives exec — after we SIGKILL script (the session
+    // leader + pty master holder) the master dies, the kernel HUPs the pty's
+    // foreground group, and the owner SURVIVES but loses its ctty (tty_nr
+    // drops to 0): the headless-zombie shape, with no exit hook in play.
+    // The owner runs from a temp file, not bun -e: script routes the command
+    // through sh -c, and shell-quoting inline JS is a collision minefield.
+    const ownerFile = `${tmpdir()}/omp-tray-tty-owner-${process.pid}.ts`;
+    await Bun.write(ownerFile, ownerSource(addr, runner));
+    const inner = `trap "" HUP; exec ${JSON.stringify(runner)} ${JSON.stringify(ownerFile)}`;
+    const script = Bun.spawn(["script", "-qfec", inner, "/dev/null"], {
+      cwd: import.meta.dir,
+      env: { ...process.env, DBUS_SESSION_BUS_ADDRESS: addr },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    // Hoisted so the backstop cleanup can reach the surviving owner (it
+    // outlives script by design) and a daemon that outlived a failed run.
+    let ownerPid = 0;
+    let daemonPid = 0;
+    try {
+      [ownerPid, daemonPid] = await readOwnerDaemonPids(script);
+      // Precondition: the owner really holds the pty as its ctty.
+      expect(ownerTtyNr(ownerPid)).toBeGreaterThan(0);
+
+      // The icon exists: the daemon registered with the watcher.
+      await waitFor(() => watcher.registrations.length >= 1, 4000, 5);
+      expect(watcher.registrations.length).toBe(1);
+
+      // Terminal death: the owner survives (HUP ignored), its ctty does not.
+      script.kill("SIGKILL");
+      await Promise.race([script.exited, Bun.sleep(2000)]);
+      await waitFor(() => ownerTtyNr(ownerPid) === 0, 4000, 50);
+      expect(ownerTtyNr(ownerPid)).toBe(0);
+
+      // The daemon follows within one poll — owner process still alive (the
+      // readable stat in ownerTtyNr proves that), names released, panel drops
+      // the icon.
+      await waitFor(() => deadOrZombie(daemonPid), 4000, 50);
+      expect(deadOrZombie(daemonPid)).toBe(true);
+
+      const client = dbus.sessionBus({ busAddress: addr });
+      try {
+        const driver = (
+          await client.getProxyObject("org.freedesktop.DBus", "/org/freedesktop/DBus")
+        ).getInterface<{ NameHasOwner(name: string): Promise<boolean> } & dbus.ClientInterface>(
+          "org.freedesktop.DBus",
+        );
+        let namesReleased = false;
+        await waitFor(() => {
+          if (!namesReleased) {
+            void driver.NameHasOwner(DAEMON_NAME).then(
+              (owned) => {
+                namesReleased = !owned;
+              },
+              () => {
+                namesReleased = true;
+              },
+            );
+          }
+          return namesReleased;
+        }, 2000, 50);
+        expect(namesReleased).toBe(true);
+      } finally {
+        try {
+          client.disconnect();
+        } catch {}
+      }
+    } finally {
+      try {
+        script.kill("SIGKILL");
+      } catch {}
+      if (ownerPid > 0) {
+        try {
+          process.kill(ownerPid, "SIGKILL");
+        } catch {}
+      }
+      if (daemonPid > 0) {
+        try {
+          process.kill(daemonPid, "SIGKILL");
+        } catch {}
+      }
+      try {
+        rmSync(ownerFile, { force: true });
+      } catch {}
+      await cleanup([], [watcherConn], busd);
+    }
+  },
+  20_000,
 );
