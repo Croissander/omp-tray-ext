@@ -71,15 +71,21 @@ test("agent_end after agent_start settles to idle even when sends reorder", asyn
   expect(observed).toEqual(["working", "idle"]);
 });
 
-test("flashError routes through the chain and cannot overtake a later idle", async () => {
+test("flashError cannot overtake a later idle; mid-flash idle defers to the revert", async () => {
   const observed: DaemonState[] = [];
   const { promise: blocked, resolve: blockError } = Promise.withResolvers<void>();
+  const idleSent = Promise.withResolvers<void>();
   const send = async (s: DaemonState): Promise<void> => {
     if (s === "error") await blocked;
     observed.push(s);
+    if (s === "idle") idleSent.resolve();
   };
 
-  const c = new TrayController(stubApi().api, send);
+  // The flash window itself is real production timing (the errorMs timer
+  // armed at send time); the test waits on the SEND it schedules, never on a
+  // guessed duration. The deferral matters because a tool error usually ends
+  // the turn — without it the X would flash for milliseconds.
+  const c = new TrayController(stubApi().api, send, 40);
   void c["flashError"]();
   // Immediately queue an idle transition — must wait for the error send.
   void c["transition"]("idle");
@@ -87,7 +93,82 @@ test("flashError routes through the chain and cannot overtake a later idle", asy
   expect(observed).toEqual([]);
   blockError();
   await drain();
+  // Ordering: the error went out first. The idle is held for the flash.
+  expect(observed).toEqual(["error"]);
+  await idleSent.promise; // the revert carries the deferred idle
+  await drain();
   expect(observed).toEqual(["error", "idle"]);
+  expect(c.state).toBe("idle");
+});
+
+test("a live working supersedes the error flash immediately", async () => {
+  const observed: DaemonState[] = [];
+  const send = async (s: DaemonState): Promise<void> => {
+    observed.push(s);
+  };
+
+  const c = new TrayController(stubApi().api, send, 5000);
+  void c["flashError"]();
+  void c["transition"]("working");
+  await drain();
+  // Ongoing work must not hide behind a stale X — and the 5 s revert timer
+  // is gone with the flash (nothing dangles past this test).
+  expect(observed).toEqual(["error", "working"]);
+  expect(c.state).toBe("working");
+});
+
+test("reseed during a flash keeps the revert on schedule (no error wedge)", async () => {
+  const observed: DaemonState[] = [];
+  const reverted = Promise.withResolvers<void>();
+  const send = async (s: DaemonState): Promise<void> => {
+    observed.push(s);
+    if (s === "working" && observed.length > 1) reverted.resolve();
+  };
+
+  // Pre-fix: reseed's job cleared the revert timer and re-sent "error" with
+  // no re-arm — the tray stayed NeedsAttention forever. Same real-timer
+  // shape as the pin above: wait on the revert SEND, not on a duration.
+  const c = new TrayController(stubApi().api, send, 40);
+  void c["transition"]("working");
+  await drain();
+  void c["flashError"]();
+  await drain();
+  void c.reseed(); // daemon respawned mid-flash
+  await drain();
+  expect(observed).toEqual(["working", "error", "error"]);
+  await reverted.promise;
+  await drain();
+  expect(observed).toEqual(["working", "error", "error", "working"]);
+  expect(c.state).toBe("working");
+});
+
+test("a turn starting before the previous idle lands keeps its abort handle", async () => {
+  const sent: DaemonState[] = [];
+  const { promise: busy, resolve: unblock } = Promise.withResolvers<void>();
+  let first = true;
+  const send = async (s: DaemonState): Promise<void> => {
+    if (first) {
+      first = false;
+      await busy;
+    }
+    sent.push(s);
+  };
+
+  const { api, events } = stubApi();
+  const c = new TrayController(api, send);
+  c.attach();
+  const aborts: number[] = [];
+  // Un-awaited like omp does: turn 1's idle is still queued behind the
+  // blocked send when turn 2 starts and captures ITS ctx. The idle job must
+  // not destroy that newer ctx (pre-fix: interrupt became a no-op).
+  void fire(events, "agent_start", {}, { abort: () => aborts.push(1) });
+  void fire(events, "agent_end", {});
+  void fire(events, "agent_start", {}, { abort: () => aborts.push(2) });
+  unblock();
+  await drain();
+  c.interrupt();
+  expect(aborts).toEqual([2]);
+  expect(sent.at(-1)).toBe("working"); // turn 2 is the live state
 });
 
 test("force always sends, bypassing the transition dedupe", async () => {
@@ -402,6 +483,12 @@ test("tool_execution_start carries the tool name as detail; idle clears it", asy
     ["working", "Edit"],
     ["idle", undefined],
   ]);
+
+  // The next turn is text-only: it must NOT inherit the last tool name
+  // (pre-fix this.detail survived the idle and sent ["working", "Edit"]).
+  await fire(events, "agent_start", {});
+  await drain();
+  expect(sent.at(-1)).toEqual(["working", undefined]);
 });
 
 test("interrupt aborts the captured run ctx and stops after the run settles", async () => {

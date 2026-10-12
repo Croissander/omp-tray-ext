@@ -53,9 +53,13 @@ omp process (transient)          tray daemon (one per session bus)
   `daemonProcessPid(timeoutMs?)` (the daemon's owning pid, null when the name
   is unowned — the adoption owner check). Also `watchSessionActions(onAction,
   timeoutMs?, probeMs?)` — the extension's persistent SessionAction
-  subscription (name-addressed match survives daemon respawns; reconnect on
-  bus error + `probeMs` liveness probe against silent socket death;
-  event-loop neutral — unref'd socket/timers, see ceilings) — and
+  subscription (name-addressed match; re-subscribes whenever the daemon name
+  is RE-OWNED — dbus-next drops signals whose sender is not its cached name
+  owner, so a respawned daemon's clicks would die silently; reconnect on
+  bus error + `probeMs` liveness probe against silent socket death; every
+  connection is hard-closed on teardown — `stream.destroy()`, `disconnect()`
+  alone only half-closes; event-loop neutral — unref'd socket/timers, see
+  ceilings) — and
   `deadline()` (shared with `daemon.ts`) plus the `__setSessionBusForTests`
   `@internal` bus-factory seam.
 - `daemon.ts` — detached process owning the SNI item (its signals are the
@@ -118,17 +122,20 @@ do anything — trust boundary) and either acts daemon-side (`Stop` →
 deferred shutdown) or emits `SessionAction(action, arg)` on the control
 interface (`("abort","")` / `("prompt", verbatim prompt text)`). Only the
 daemon's exclusive name can be the signal's sender, so spoofing requires
-owning the slot. `ItemIsMenu` is `true` (the menu is real). The Event/
-GetProperty arg types are canonical per the KDE/libdbusmenu interface
-(`Event` is `(i,s,v,u)`; `GetProperty` `(i,s)`) — the stub-era `(u,…)` types
-mismatched every conformant client's marshalling and would have rejected
-clicks on signature.
+owning the slot. `ItemIsMenu` is `true` (the menu is real). Every
+method signature is canonical per the `com.canonical.dbusmenu` interface
+(`GetGroupProperties` `aias`, `Event` `(i,s,v,u)`, `GetProperty` `(i,s)`,
+`EventGroup` `a(isvu)` → `ai` **idErrors** = the ids NOT acted on,
+`AboutToShowGroup` `ai` → `aiai` (`updatesNeeded`, `idErrors`)) — the stub-era
+`auas` / `a(usuv)`/`au` / `aib` shapes mismatched every conformant client's
+marshalling (dbus-next dispatches on an EXACT in-signature match) and rejected
+those calls outright.
 
 | Agent state | Icon | SNI `Status` | Trigger |
 |---|---|---|---|
 | idle | `>_` | `Active` | `session_start` (via `force`) / terminal `agent_end` (`willContinue` falsy) / session switch/shutdown |
 | working | spinning ring (8 frames, ~8 fps) | `Active` | in-run turn events (see above) |
-| error | `X` | `NeedsAttention` | `tool_result` with `isError`; auto-clears `errorMs` (5 s) after the error **send**, back to the **pre-error** state |
+| error | `X` | `NeedsAttention` | `tool_result` with `isError`; auto-clears `errorMs` (5 s) after the error **send**, back to the **pre-error** state (a non-forced `idle` arriving mid-flash becomes the revert target instead of erasing the flash) |
 
 ### Key invariants (do not break)
 
@@ -223,7 +230,10 @@ clicks on signature.
   (never neither), and appearances seen while bootstrapping coalesce into the
   single initial register. Registration is idempotent and deadline-bounded
   (3 s): bursts coalesce to at most one extra attempt and failure is
-  warn-only — the next owner appearance retries.
+  warn-only — the next owner appearance retries. The Debug `watcher` row is
+  truth-telling: it flips to `watcher: not registered` the moment the watcher
+  name is LOST (our item died with its in-memory list) and back to
+  `registered` only after a successful re-registration.
 - **Startup publishes state BEFORE watcher registration.** The full initial
   render runs before `RegisterStatusNotifierItem`: a fast host snapshots
   `GetAll` at registration time and must already see `Status "Active"` + icon
@@ -261,7 +271,13 @@ clicks on signature.
   not when the timer is armed; likewise `reseed()` and the revert read
   `current`/`revertTo` INSIDE the chain job — a call-time capture with a
   chain backlog replays a stale state and the fresh daemon gets stuck on it.
-  The flash routes through the same chain so an un-awaited error send can't
+  A live flash is only ended by a REAL state change: `working` (or a forced
+  `idle`) supersedes it — ongoing work must not hide behind a stale X — while
+  a non-forced `idle` merely becomes the revert target (tool errors usually
+  end the turn; without the deferral the X flashed for milliseconds). A
+  re-send of `"error"` (`reseed()` mid-flash, `/tray error`) KEEPS the live
+  timer: clearing it with no re-arm wedged the tray on `"error"` forever. The
+  flash routes through the same chain so an un-awaited error send can't
   overtake a later idle/working.
 - **Tray IPC never blocks the agent loop.** `sendState` resolves `false` when
   the daemon is unreachable; the `send` seam then fires `recover()` (respawn +
@@ -286,14 +302,20 @@ clicks on signature.
   session handles actions). `interrupt()` calls `ctx.abort()` on the ctx
   captured at `agent_start` — the ONLY abort handle omp gives extensions (no
   `pi.abort()`) — cleared in the idle transition's job BEFORE its `await`
-  (clearing after would stomp a newer run's ctx captured mid-send), and
+  (clearing after would stomp a newer run's ctx captured mid-send) and only
+  when that ctx is STILL the one captured when the idle was queued (a turn 2
+  starting while turn 1's idle is queued keeps its abort handle), and
   deliberately NOT chained (aborting must not wait behind tray sends).
   Quick prompts go out via `pi.sendUserMessage` (idle → starts a turn;
   streaming → queues as steer). The action listener self-heals like the
   daemon's own bus link: reconnect on bus `error` plus a `probeMs` liveness
   probe — pending calls never settle on a clean socket close, and
   `NameHasOwner === false` is a HEALTHY probe answer (an absent daemon is
-  valid; the name-addressed match revives with it). It is fire-and-forget
+  valid; the name-addressed match revives with it). It also tears down and
+  re-subscribes whenever the daemon name is RE-OWNED: dbus-next's signal
+  filter compares senders against its cached name owner, so a respawned
+  daemon (new unique name) would otherwise be dropped as foreign — every
+  menu click dead after one daemon restart. It is fire-and-forget
   from the omp flow and warns on handler errors.
 - **Known ceilings:** (a) icon removal after a hard-killed owner lags up to
   one watchdog poll (1 s) plus the bus's name sweep; (b) an owner-less daemon
@@ -349,7 +371,7 @@ Flat root — no `src/`; all source, tests, and config live beside each other:
 ```bash
 bun install                       # one-time; dbus-next only
 bunx tsc --noEmit                 # typecheck (strict) — after every change
-bun test                          # full suite (5 files, 66 tests)
+bun test                          # full suite (5 files, 73 tests)
 bun test controller.test.ts       # single file (each header states its command)
 bun ./icons.ts                    # render glyphs, print pixel counts (visual check)
 ```
@@ -470,12 +492,12 @@ Authoritative: <https://omp.sh/docs/extension-authoring>,
 | `controller.ts` | `TrayController` — turn-windowed event→state mapping + serialized chain (flash timing), run-ctx capture for `interrupt()`, tool-name detail |
 | `ipc.ts` | DBus contract constants + deadline-bounded client (`daemonAlive`/`daemonProcessPid`/`sendState`(+detail)/`stopDaemon`, `watchSessionActions`, `deadline()`, `__setSessionBusForTests`) |
 | `icons.ts` | Glyph drawing + ARGB conversion; `import.meta.main` visual demo |
-| `index.test.ts` | Spawn-runner resolution + extension pins (single-flight spawn, reseed-after-failed-ensure, no-suppression, shutdown-no-kill, restart failure, owner-verified adoption + `isOwnerless` parse, menu-action single-flight route; bun:test) |
-| `controller.test.ts` | Chain-ordering/state-machine + turn-window mapping + flash-timing + interrupt/detail pins (bun:test) |
+| `index.test.ts` | Spawn-runner resolution + extension pins (single-flight spawn, reseed-after-failed-ensure, no-suppression, shutdown-no-kill, restart failure, owner-verified adoption + `isOwnerless` parse, `/tray` command routing + completion contract, menu-action single-flight route; bun:test) |
+| `controller.test.ts` | Chain-ordering/state-machine + turn-window mapping + flash-timing (deferral/supersede/reseed) + interrupt/detail pins (bun:test) |
 | `icons.test.ts` | Pixel/ARGB correctness suite (bun:test) |
-| `daemon.test.ts` | `stateView` render-mapping + hermetic lifecycle pins (slot, watcher-restart, SNI conformance, initial-state, SIGTERM-during-startup, owner-lifetime (predecease, stale-icon, setsid-owner, tty-loss), menu layout/live-properties/click-routing; bun:test) |
-| `ipc.test.ts` | `deadline` unit pins + fake-bus RPC pins (never-settle, success, disconnect-always, owner-pid probe, detail RPC, action-listener reconnect/probe; bun:test) |
-| `.github/workflows/ci.yml` | CI: `bun install --frozen-lockfile` + gates on push/PR |
+| `daemon.test.ts` | `stateView` render-mapping + hermetic lifecycle pins (slot, watcher-restart, SNI conformance, initial-state, SIGTERM-during-startup, owner-lifetime (predecease, stale-icon, setsid-owner, tty-loss), menu layout/live-properties/click-routing + canonical dbusmenu signatures; bun:test) |
+| `ipc.test.ts` | `deadline` unit pins + fake-bus RPC pins (never-settle, success, disconnect-always, owner-pid probe, detail RPC, action-listener reconnect/probe/respawn; bun:test) |
+| `.github/workflows/ci.yml` | CI: `bun install --frozen-lockfile` + gates on push/PR; installs `dbus` so the daemon suite runs instead of self-skipping |
 | `package.json` | `omp.extensions` load hook; `name` doubles as `disabledExtensions` key; `version` couples to git tag |
 | `tsconfig.json` | Strict flags — see Runtime/Tooling Preferences |
 | `bun.lock` | Committed lockfile; pinned SHAs affect `omp install` update detection |
@@ -506,7 +528,7 @@ Authoritative: <https://omp.sh/docs/extension-authoring>,
 ## Testing & QA
 
 - Framework: **bun:test** (`import { test, expect } from "bun:test"`), flat
-  `*.test.ts` beside sources. Full suite `bun test` (66 tests / 5 files);
+  `*.test.ts` beside sources. Full suite `bun test` (73 tests / 5 files);
   each file's header comment states its single-file command.
 - `index.test.ts` pins the spawn runner and extension lifetime:
   `resolveDaemonRunner` prefers `bun` from PATH and returns `null` for a
@@ -518,23 +540,31 @@ Authoritative: <https://omp.sh/docs/extension-authoring>,
   failure spawns and adopts nothing (restart-failure pin); an owner-less
   daemon is stopped and replaced, never adopted (stale-icon self-heal pin);
   `isOwnerless` parses `stat` ppid (comm with parens/spaces) and treats a
-  vanished pid as owner-less (parse pin); menu actions route to the newest
+  vanished or unparseable stat as owner-less (parse pin); `/tray` routes
+  status/stop/working/error/debug to the daemon/controller and the argument
+  completions follow the omp contract (trailing space, prefix filter, `null`
+  past a space or on no match); menu actions route to the newest
   activation with exactly ONE SessionAction subscription across every
   rebinding in the file (single-flight route pin — must stay the LAST test,
   the listener is a process-wide singleton started by the first `ompTray()`).
 - `controller.test.ts` pins the ordering + timing invariants: FIFO chain under
-  send reordering, error flash can't overtake a later idle, `force` bypasses
+  send reordering, error flash can't overtake a later idle (and a mid-flash
+  idle defers to the revert instead of erasing the flash — while a live
+  `working` supersedes it), `force` bypasses
   the dedupe, `reseed` replays state after a daemon respawn AND reads it at
   job execution (not call time), flash dedupe, revert to the **pre-error**
   state after `errorMs`, `errorMs` measured from the error **send** (not the
-  call), and a flash/transition/flash burst reverts to the pre-flash state.
+  call), a `reseed` mid-flash keeps the revert on schedule (no error wedge),
+  and a flash/transition/flash burst reverts to the pre-flash state.
   Its turn-window mapping pins: cache-warm idle replays can't reopen working
   (no `before_provider_request`), non-loop idle `tool_result` (success
   ignored, error still flashes), `willContinue` `agent_end` keeps the window
   open, and session switch/shutdown close a window that never got its
   `agent_end`. Its quick-action pins: `tool_execution_start` carries the tool
-  name as detail (sent even on a state dedupe; idle clears it), and
-  `interrupt()` aborts the ctx captured at `agent_start`, no-ops before any
+  name as detail (sent even on a state dedupe; idle clears it — the next
+  turn inherits no stale tool name), and
+  `interrupt()` aborts the ctx captured at `agent_start` (including a turn 2
+  starting before turn 1's idle lands), no-ops before any
   run, and is inert after the run settles.
 - `icons.test.ts` pins pixel correctness: `[a,r,g,b]` byte order, visible
   glyphs/frames, pairwise-distinct spinner frames, 8-frame wraparound, shared
@@ -544,8 +574,10 @@ Authoritative: <https://omp.sh/docs/extension-authoring>,
   instances (`===` identity); importing `daemon.ts` is side-effect-free. Its
   lifecycle pins run real `daemon.ts` children on a PRIVATE throwaway
   `dbus-daemon` session bus with a fake StatusNotifierWatcher: single-instance
-  slot (one registration + one survivor), watcher-restart re-registration, SNI
-  conformance (`Category`/`Menu`/`ItemIsMenu`, `NewStatus` `(s)` payload,
+  slot (one registration + one survivor), watcher-restart re-registration
+  (with the Debug `watcher` row flipping down at watcher death and back up at
+  re-registration), SNI
+  conformance (`Category`/`Menu`/`ItemIsMenu`, `WindowId` 0, `NewStatus` `(s)` payload,
   `NewToolTip` only on tooltip-text change), initial state published before
   registration, SIGTERM during the startup connect window exiting promptly
   (silent Unix-socket listener that accepts but never completes the D-Bus
@@ -561,7 +593,10 @@ Authoritative: <https://omp.sh/docs/extension-authoring>,
   ids, disabled header, submenu depth/property filtering, `GetGroupProperties`,
   `AboutToShow` false; live header label + tooltip with `SetDetail` and
   `ItemsPropertiesUpdated`; click routing over `SessionAction` — prompt text
-  verbatim from the layout, abort, junk inert, Stop exits the daemon). Plus a
+  verbatim from the layout, abort, junk inert, Stop exits the daemon; and the
+  canonical dbusmenu signatures — raw wire calls in `aias`/`a(isvu)`/`aiai`
+  shapes land, `EventGroup` returns `idErrors` (ids NOT acted on),
+  `AboutToShowGroup` returns (`updatesNeeded`, `idErrors`)). Plus a
   `ownerTtyNr` parse pin (comm with parens/spaces; a
   truncated or unreadable stat reads as -1 "unknown", never as terminal
   death). Self-skips when the `dbus-daemon` (or, for tty-loss, `script`)
@@ -576,7 +611,9 @@ Authoritative: <https://omp.sh/docs/extension-authoring>,
   name is unowned or the call hangs. `sendState` detail pins: the detail RPC
   rides the same connection, a detail failure never fails the send, no detail
   → only `SetState`. `watchSessionActions` pins: one persistent connection
-  delivering `SessionAction` payloads, reconnect after a bus error, a failed
+  delivering `SessionAction` payloads, reconnect after a bus error, actions
+  keep flowing after the daemon name is RE-OWNED (respawn pin — the
+  sender-owner cache re-learns), a failed
   liveness probe (silent socket death) drops and re-subscribes with no churn
   beyond the one recovery, and a child process that starts the listener exits
   by itself (event-loop neutrality — the omp install hang regression).

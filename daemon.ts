@@ -73,6 +73,12 @@ const MENU_TREE: Record<number, number[]> = {
   [M_DEBUG]: [M_DEBUG_VERSION, M_DEBUG_STARTED, M_DEBUG_OWNER, M_DEBUG_WATCHER],
 };
 
+/** Every id that names a menu item (AboutToShowGroup's idErrors contract). */
+const MENU_IDS: Record<number, true> = {
+  ...Object.fromEntries(Object.keys(MENU_TREE).map((id) => [Number(id), true])),
+  ...Object.fromEntries(Object.values(MENU_TREE).flat().map((id) => [id, true])),
+};
+
 const LAYOUT_REVISION = 1;
 
 type MenuProps = Record<string, dbus.Variant>;
@@ -113,7 +119,9 @@ class OmpTrayItem extends iface.Interface {
   ItemIsMenu = true;
   Menu = "/MenuBar";
   Status = "Passive";
-  ToolIconName = "";
+  // Spec 3.1.5 (UINT32, "0 if not interested"): hosts GetAll the property
+  // list and a missing WindowId is an UnknownProperty hit on some panels.
+  WindowId = 0;
   IconName = "";
   IconThemePath = "";
   AttentionIconName = "";
@@ -149,7 +157,7 @@ OmpTrayItem.configureMembers({
     ItemIsMenu: { signature: "b", access: "read" },
     Menu: { signature: "o", access: "read" },
     Status: { signature: "s", access: "readwrite" },
-    ToolIconName: { signature: "s", access: "read" },
+    WindowId: { signature: "u", access: "read" },
     IconName: { signature: "s", access: "readwrite" },
     IconThemePath: { signature: "s", access: "read" },
     AttentionIconName: { signature: "s", access: "readwrite" },
@@ -273,10 +281,13 @@ class OmpTrayMenu extends iface.Interface {
     this.dispatch(id, eventId);
   }
 
-  // Canonical events are (u,s,v,u) — id typed u here but i in Event. Weird,
-  // but both real implementations agree.
+  /**
+   * Batch Event. Returns `idErrors` — the ids of events we could NOT act on
+   * (spec: "an error is when the id doesn't exist or when the event was not
+   * understood"): unknown ids, inert rows, non-"clicked" events.
+   */
   EventGroup(events: [number, string, dbus.Variant, number][]): number[] {
-    return events.filter(([id, eventId]) => this.dispatch(id, eventId)).map(([id]) => id);
+    return events.filter(([id, eventId]) => !this.dispatch(id, eventId)).map(([id]) => id);
   }
 
   AboutToShow(_id: number): boolean {
@@ -285,8 +296,10 @@ class OmpTrayMenu extends iface.Interface {
     return false;
   }
 
-  AboutToShowGroup(ids: number[]): [number, boolean][] {
-    return ids.map((id): [number, boolean] => [id, false]);
+  /** Spec: (updatesNeeded, idErrors) — never an update; ids that name no
+   *  item are errors. */
+  AboutToShowGroup(ids: number[]): [number[], number[]] {
+    return [[], ids.filter((id) => !MENU_IDS[id])];
   }
 
   /** Emit ItemsPropertiesUpdated to cached clients (header label, enabled, watcher row). */
@@ -314,16 +327,18 @@ OmpTrayMenu.configureMembers({
   },
   methods: {
     GetLayout: { inSignature: "iias", outSignature: "u(ia{sv}av)" },
-    GetGroupProperties: { inSignature: "auas", outSignature: "a(ia{sv})" },
-    // Canonical arg types per the KDE/libdbusmenu interface: id is i (and
-    // Event's data rides BEFORE the timestamp). The stub-era (us)/(usuv) here
-    // mismatched every conformant client's marshalling once real items
-    // existed — clicks would have been rejected on signature.
+    // Canonical signatures per the com.canonical.dbusmenu interface (the
+    // waybar/libdbusmenu XML): ids are ai, EventGroup is a(isvu) → ai
+    // idErrors, AboutToShowGroup is ai → ai ai. The stub-era "auas" /
+    // "a(usuv)"/"au" / "aib" mismatched every conformant client's
+    // marshalling — dbus-next dispatches on an EXACT in-signature match, so
+    // those calls were rejected outright.
+    GetGroupProperties: { inSignature: "aias", outSignature: "a(ia{sv})" },
     GetProperty: { inSignature: "is", outSignature: "v" },
     Event: { inSignature: "isvu" },
-    EventGroup: { inSignature: "a(usuv)", outSignature: "au" },
+    EventGroup: { inSignature: "a(isvu)", outSignature: "ai" },
     AboutToShow: { inSignature: "i", outSignature: "b" },
-    AboutToShowGroup: { inSignature: "ai", outSignature: "aib" },
+    AboutToShowGroup: { inSignature: "ai", outSignature: "aiai" },
   },
   signals: {
     ItemsPropertiesUpdated: { signature: "a(ia{sv})a(ias)" },
@@ -695,7 +710,15 @@ class Daemon {
     let bootstrapping = true;
     let sawAppearance = false;
     driver.on("NameOwnerChanged", (name: string, _oldOwner: string, newOwner: string) => {
-      if (name !== WATCHER_NAME || newOwner === "") return;
+      if (name !== WATCHER_NAME) return;
+      if (newOwner === "") {
+        // The watcher died with the panel: our item died with its in-memory
+        // list. Say so in the menu instead of claiming "registered" until
+        // the next appearance re-registers us.
+        this.watcherRegistered = false;
+        this.menu?.pushProperties([[M_DEBUG_WATCHER, { label: svar("watcher: not registered") }]]);
+        return;
+      }
       if (bootstrapping) {
         sawAppearance = true;
         return;

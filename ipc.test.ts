@@ -12,7 +12,7 @@
 
 import { afterEach, expect, test } from "bun:test";
 import type { MessageBus } from "dbus-next";
-import { __setSessionBusForTests, daemonAlive, daemonProcessPid, deadline, sendState, stopDaemon, watchSessionActions } from "./ipc";
+import { __setSessionBusForTests, DAEMON_NAME, daemonAlive, daemonProcessPid, deadline, sendState, stopDaemon, watchSessionActions } from "./ipc";
 
 // Restore the real bus factory even when a test fails mid-flight.
 afterEach(() => {
@@ -257,10 +257,37 @@ test("sendState carries the detail over the same connection; a detail failure ne
 
 // --- (g) watchSessionActions pins --------------------------------------------
 
-/** Fake bus for the action listener: subscribes SessionAction, can emit. */
-function fakeActionBus(opts: { probeRejects?: boolean } = {}) {
-  const subscriptions: ((action: string, arg: string) => void)[] = [];
+/**
+ * Fake bus for the action listener: subscribes SessionAction, can emit.
+ * Models the ONE dbus-next behavior the listener must survive: signals are
+ * dropped unless the sender is the CACHED owner of the well-known name
+ * (proxy-interface.js `ProxyListener`), and that cache re-learns only from a
+ * delivered NameOwnerChanged or a call reply FROM the name.
+ */
+type SignalListener = (...args: string[]) => void;
+
+interface FakeActionBus {
+  disconnectCount: number;
+  on(event: string, listener: () => void): void;
+  disconnect(): void;
+  getProxyObject(name: string): Promise<{
+    getInterface(): { on(event: string, cb: SignalListener): void; NameHasOwner(): Promise<boolean> };
+  }>;
+  /** Deliver a SessionAction as `daemonOwner` — dropped unless the cache agrees. */
+  emitAction(action: string, arg: string): void;
+  emitError(): void;
+  /** Re-own the daemon name (respawn): delivered NameOwnerChanged messages
+   *  refresh the cache — only for connections that subscribed to them. */
+  reown(newOwner: string): void;
+  subscriptionCount(): number;
+}
+
+function fakeActionBus(opts: { probeRejects?: boolean } = {}): FakeActionBus {
+  const subscriptions: SignalListener[] = [];
   const errorListeners: (() => void)[] = [];
+  const ownerListeners: SignalListener[] = [];
+  let daemonOwner = ":1.1"; // the real owner behind DAEMON_NAME
+  let cachedOwner = ":1.1"; // what the signal filter compares against
   const bus = {
     disconnectCount: 0,
     on(event: string, listener: () => void) {
@@ -270,13 +297,17 @@ function fakeActionBus(opts: { probeRejects?: boolean } = {}) {
     disconnect() {
       this.disconnectCount += 1;
     },
-    getProxyObject() {
+    getProxyObject(name: string) {
+      // A call reply from the name seeds the owner cache (bus.js `call`).
+      if (name === DAEMON_NAME) cachedOwner = daemonOwner;
       return Promise.resolve({
         getInterface: () => ({
-          // Drives both the control proxy (SessionAction) and the driver
-          // proxy (the liveness probe's NameHasOwner).
-          on: (event: string, cb: (action: string, arg: string) => void) => {
+          // Drives the control proxy (SessionAction), the driver proxy (the
+          // liveness probe's NameHasOwner and the owner-change watch), and
+          // the identity checks both make.
+          on: (event: string, cb: SignalListener) => {
             if (event === "SessionAction") subscriptions.push(cb);
+            if (event === "NameOwnerChanged") ownerListeners.push(cb);
           },
           NameHasOwner: () =>
             opts.probeRejects ? Promise.reject(new Error("dead socket")) : Promise.resolve(true),
@@ -284,10 +315,19 @@ function fakeActionBus(opts: { probeRejects?: boolean } = {}) {
       });
     },
     emitAction: (action: string, arg: string) => {
+      if (cachedOwner !== daemonOwner) return; // dropped as a foreign sender
       for (const cb of subscriptions) cb(action, arg);
     },
     emitError: () => {
       for (const l of errorListeners) l();
+    },
+    /** The name is re-owned (daemon respawn): delivered NameOwnerChanged
+     *  messages refresh the cache — only for connections that subscribed. */
+    reown: (newOwner: string) => {
+      const old = daemonOwner;
+      daemonOwner = newOwner;
+      if (ownerListeners.length > 0) cachedOwner = newOwner;
+      for (const cb of ownerListeners) cb(DAEMON_NAME, old, newOwner);
     },
     subscriptionCount: () => subscriptions.length,
   };
@@ -301,7 +341,7 @@ async function until(check: () => boolean, ms = 1500): Promise<void> {
 
 test("watchSessionActions delivers SessionAction payloads and reconnects after a bus error", async () => {
   const received: [string, string][] = [];
-  const buses: ReturnType<typeof fakeActionBus>[] = [];
+  const buses: FakeActionBus[] = [];
   __setSessionBusForTests(() => {
     const bus = fakeActionBus();
     buses.push(bus);
@@ -331,7 +371,7 @@ test("watchSessionActions delivers SessionAction payloads and reconnects after a
 });
 
 test("watchSessionActions reconnects when the connection silently dies (probe pin)", async () => {
-  const buses: ReturnType<typeof fakeActionBus>[] = [];
+  const buses: FakeActionBus[] = [];
   __setSessionBusForTests(() => {
     // The FIRST connection's probe rejects (dead socket, no error event —
     // the dbus-next defect); every later connection is healthy.
@@ -347,6 +387,34 @@ test("watchSessionActions reconnects when the connection silently dies (probe pi
     expect(buses[0]?.disconnectCount).toBe(1);
     await Bun.sleep(60); // no reconnect churn beyond the one recovery
     expect(buses.length).toBe(2);
+  } finally {
+    stop();
+  }
+});
+
+test("watchSessionActions keeps delivering after the daemon name is re-owned (respawn pin)", async () => {
+  const received: [string, string][] = [];
+  const buses: FakeActionBus[] = [];
+  __setSessionBusForTests(() => {
+    const bus = fakeActionBus();
+    buses.push(bus);
+    return bus as unknown as MessageBus;
+  });
+
+  const stop = watchSessionActions((action, arg) => received.push([action, arg]), 50, 20);
+  try {
+    await until(() => buses[0]?.subscriptionCount() === 1);
+    buses[0]!.emitAction("abort", "");
+    expect(received).toEqual([["abort", ""]]);
+
+    // The daemon dies and a fresh one claims the name under a NEW unique id
+    // (what every respawn looks like on the bus).
+    buses[0]!.reown(":1.2");
+    // The listener must re-subscribe and re-learn the owner — pre-fix the
+    // stale owner cache dropped every later action as a foreign sender.
+    await until(() => buses.length >= 2 && buses[1]?.subscriptionCount() === 1);
+    buses[1]!.emitAction("prompt", "Commit the changes");
+    expect(received.at(-1)).toEqual(["prompt", "Commit the changes"]);
   } finally {
     stop();
   }

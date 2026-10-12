@@ -97,7 +97,8 @@ export function glyph(kind: IconKind): Pixels {
 }
 
 export function spinnerFrameByIndex(i: number): Pixels {
-  return spinnerFrames[i % 8] ?? spinnerFrames[0]!;
+  // Cyclic for any sign: -1 % 8 is -1 in JS, not 7.
+  return spinnerFrames[((i % 8) + 8) % 8] ?? spinnerFrames[0]!;
 }
 
 /** Convert a Pixels buffer to ARGB32 (a,r,g,b) bytes for SNI IconPixmap. */
@@ -125,7 +126,8 @@ if (import.meta.main) {
   };
   for (const [name, px] of Object.entries(glyphs)) {
     const { bytes } = toArgb(px);
-    const on = Array.from(bytes).filter((b, i) => i % 4 === 3 && b !== 0).length;
+    // ARGB32: byte 0 of each pixel is the alpha channel (the visibility bit).
+    const on = Array.from(bytes).filter((b, i) => i % 4 === 0 && b !== 0).length;
     console.log(`${name}: ${px.w}x${px.h} opaque_pixels=${on}`);
   }
 }

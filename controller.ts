@@ -23,7 +23,8 @@ function messageRole(message: unknown): string | undefined {
  *  - assistant message_start / tool_execution_start / tool_result → working,
  *    only inside the agent_start..terminal agent_end window (`inRun`)
  *  - tool_result(isError) → error anywhere (transient; reverts to the
- *    pre-error state after errorMs)
+ *    pre-error state after errorMs — an interleaved idle becomes the revert
+ *    target instead of cutting the flash short; working supersedes it)
  *  - session_before_switch / session_switch / session_shutdown → idle
  *    (a mid-turn switch swallows agent_end; these are the only idle signal)
  *  - (shutdown handled by index.ts: stops the daemon on quit)
@@ -83,19 +84,43 @@ export class TrayController {
     state: DaemonState | (() => DaemonState),
     force = false,
   ): Promise<void> {
+    // The run ctx AT CALL TIME: the idle job may only clear the run whose
+    // idle this is. Turn 2's agent_start captures its ctx while turn 1's
+    // idle is still queued behind an in-flight send — an unconditional clear
+    // in the job would destroy turn 2's abort handle (interrupt race).
+    const settleCtx = this.runCtx;
     // Catch so a failing send (e.g. timeout) can't reject the chain and wedge
     // every later state — that would reproduce the stuck-spinning bug.
     this.chain = this.chain
       .then(async () => {
-        if (this.errorClearTimer) {
-          clearTimeout(this.errorClearTimer);
-          this.errorClearTimer = null;
-        }
         const next = typeof state === "function" ? state() : state;
         if (next === "idle") {
           // Cleared BEFORE the await: a newer run's ctx captured while this
           // send is in flight must survive the idle job finishing.
-          this.runCtx = null;
+          if (this.runCtx === settleCtx) this.runCtx = null;
+          // Idle ends the run detail — the next turn must not inherit the
+          // last tool name ("Working · Edit" on a text-only turn).
+          this.detail = null;
+        }
+        if (this.errorClearTimer) {
+          if (next === "error") {
+            // Re-sending "error" (reseed after a daemon respawn, /tray
+            // error) must KEEP the live revert timer: clearing it here with
+            // no re-arm wedges the tray on "error" forever.
+          } else if (next === "idle" && !force) {
+            // An end-of-turn idle must not swallow a fresh error flash (the
+            // error would flash for milliseconds — the model usually ends
+            // the turn right after the failing tool). The flash holds the
+            // icon for its errorMs window and this idle becomes the revert
+            // target, read when the revert runs — later transitions win.
+            this.revertTo = "idle";
+            return;
+          } else {
+            // A live state change (working, or a forced idle) supersedes the
+            // flash: ongoing work must not hide behind a stale X.
+            clearTimeout(this.errorClearTimer);
+            this.errorClearTimer = null;
+          }
         }
         const detail = next === "idle" ? null : this.detail;
         // Detail changes send even on a state dedupe: Bash → Edit must reach

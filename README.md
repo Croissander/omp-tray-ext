@@ -24,7 +24,7 @@ and pushed as `IconPixmap` ARGB data over DBus.
 |-------------|-----------|--------------|----------|
 | idle | `>_` prompt glyph | `Active` | `session_start` / terminal `agent_end` / `session_before_switch` / `session_switch` / `session_shutdown` |
 | working | spinning ring (rotated circle, chunk missing; monochrome) | `Active` | `agent_start`, and inside the run window only: assistant `message_start` / `tool_execution_start` / `tool_result` (success) |
-| error | `X` crossed strokes | `NeedsAttention` | `tool_result` with `isError` — any time, even outside a run (auto-clears after 5 s, reverting to the pre-error state) |
+| error | `X` crossed strokes | `NeedsAttention` | `tool_result` with `isError` — any time, even outside a run (auto-clears after 5 s, reverting to the pre-error state; a turn ending mid-flash becomes the revert target instead of cutting the flash short) |
 
 Mapping is **turn-windowed**: a run window opens at `agent_start` and closes at
 a terminal `agent_end` (`willContinue` falsy — a continuation, including an
@@ -41,7 +41,8 @@ minutes) with no run around it.
 Idle-time provider traffic (prompt-cache warming) and background tool results
 cannot strand the spinner. Background failures still surface: a `tool_result`
 with `isError` flashes the error glyph even while idle, then self-reverts to
-the pre-error state.
+the pre-error state — and when the turn ends right after the failing tool, the
+idle waits out the flash instead of erasing it; resumed work supersedes it.
 
 The spinner animates at ~8 fps while the agent is working — each frame is a
 ring with a ~90° arc gap, rotated 45° per frame.
@@ -229,7 +230,7 @@ imports the TypeScript directly via Bun.
 ```bash
 bun install          # one-time; dbus-next only
 bunx tsc --noEmit    # typecheck (strict)
-bun test             # full suite (5 files / 66 tests)
+bun test             # full suite (5 files / 73 tests)
 bun test index.test.ts
 bun test controller.test.ts
 bun test icons.test.ts

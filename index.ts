@@ -88,7 +88,11 @@ export function isOwnerless(
   try {
     // stat is "pid (comm) state ppid ..."; comm may contain spaces/parens.
     const stat = statOf(pid);
-    const ppid = stat.slice(stat.lastIndexOf(")") + 2).split(" ")[1];
+    const end = stat.lastIndexOf(")");
+    // No closing paren = unparseable garbage — never read it as "owned"
+    // (that would adopt a stale daemon); same answer as a vanished pid.
+    if (end < 0) return true;
+    const ppid = stat.slice(end + 2).split(" ")[1];
     return ppid === "1";
   } catch {
     return true; // vanished mid-check — definitely not owned

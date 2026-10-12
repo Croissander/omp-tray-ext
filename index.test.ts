@@ -105,22 +105,28 @@ function fakeBus(opts: {
 /** The only ctx surface the pinned command paths touch. */
 interface StubCtx {
   ui: { notify(message: string, kind: string): void };
+  model?: { provider: string; id: string } | null;
+  isIdle?: () => boolean;
+  cwd?: string;
+}
+
+/** One registered slash command as the tests drive it. */
+interface StubCommand {
+  handler: (args: string, ctx: StubCtx) => Promise<void>;
+  getArgumentCompletions?: (argumentPrefix: string) => { value: string; label: string; description: string }[] | null;
 }
 
 /** Minimal ExtensionAPI double: captures handlers/commands per activation. */
 function stubPi() {
   const events = new Map<string, (event?: unknown, ctx?: unknown) => unknown>();
-  const commands = new Map<string, { handler: (args: string, ctx: StubCtx) => Promise<void> }>();
+  const commands = new Map<string, StubCommand>();
   const userMessages: string[] = [];
   const warnings: string[] = [];
   const api = {
     on: (event: string, handler: (event?: unknown, ctx?: unknown) => unknown) => {
       events.set(event, handler);
     },
-    registerCommand: (
-      name: string,
-      spec: { handler: (args: string, ctx: StubCtx) => Promise<void> },
-    ) => {
+    registerCommand: (name: string, spec: StubCommand) => {
       commands.set(name, spec);
     },
     sendUserMessage: (content: string) => {
@@ -278,6 +284,75 @@ test("restart reports failure and spawns nothing when stop fails (restart-failur
   expect(spawns).toBe(0);
 });
 
+test("/tray argument completions follow the omp contract", () => {
+  __setSessionBusForTests(() => fakeBus({}) as unknown as MessageBus);
+  const cap = stubPi();
+  ompTray(cap.api);
+  const complete = cap.commands.get("tray")?.getArgumentCompletions;
+  if (!complete) throw new Error("no completions registered");
+
+  // Empty prefix: every subcommand, each value carrying the trailing space
+  // the extension runner requires.
+  const all = complete("");
+  if (!all) throw new Error("empty prefix must list every subcommand");
+  expect(all.map((c) => c.label).sort()).toEqual(
+    ["debug", "error", "off", "restart", "status", "stop", "working"].sort(),
+  );
+  for (const c of all) expect(c.value).toBe(`${c.label} `);
+
+  // Prefix-filtered (case-insensitive), and null on no match or past a space.
+  expect(complete("ST")?.map((c) => c.label).sort()).toEqual(["status", "stop"]);
+  expect(complete("st")).not.toBeNull();
+  expect(complete("zzz")).toBeNull();
+  expect(complete("stop ")).toBeNull();
+});
+
+test("/tray routes status/stop/working/error/debug to the daemon and controller", async () => {
+  const sends: string[] = [];
+  let stops = 0;
+  __setSessionBusForTests(
+    () =>
+      fakeBus({
+        onSetState: (s) => {
+          sends.push(s);
+        },
+        onStop: () => {
+          stops += 1;
+        },
+      }) as unknown as MessageBus,
+  );
+
+  const cap = stubPi();
+  ompTray(cap.api);
+  const command = cap.commands.get("tray");
+  if (!command) throw new Error("no tray command registered");
+  const notes: [string, string][] = [];
+  const ctx: StubCtx = {
+    ui: {
+      notify: (message, kind) => {
+        notes.push([message, kind]);
+      },
+    },
+    model: { provider: "test", id: "m" },
+    isIdle: () => true,
+    cwd: "/tmp",
+  };
+  await command.handler("debug", ctx);
+  // Debug names the live daemon and the controller state (no mirror).
+  expect(notes.at(-1)?.[0]).toContain("daemon running : true");
+
+  // Forced states reach the bus; stop/off both stop the shared daemon.
+  await command.handler("working", ctx);
+  await command.handler("stop", ctx);
+  await command.handler("off", ctx);
+  expect(sends).toEqual(["working"]);
+  expect(stops).toBe(2);
+
+  // Default (no args): status.
+  await command.handler("", ctx);
+  expect(notes.at(-1)).toEqual(["Tray daemon running (persistent)", "info"]);
+});
+
 test("session_shutdown settles the icon and never kills the daemon (shutdown-no-kill pin)", async () => {
   const sends: string[] = [];
   let spawns = 0;
@@ -356,6 +431,9 @@ test("isOwnerless: reaped parent = orphaned, live parent = owned (parse pin)", (
   expect(isOwnerless(1, () => statWith("bun daemon.ts", 4567))).toBe(false);
   expect(isOwnerless(1, () => statWith("foo) bar (baz", 1))).toBe(true);
   expect(isOwnerless(1, () => statWith("foo) bar (baz", 4567))).toBe(false);
+  // No closing paren at all: unparseable garbage must never read as "owned"
+  // (adoption would keep a stale daemon's icon alive).
+  expect(isOwnerless(1, () => "123 truncated garbage")).toBe(true);
   // Vanished between lookup and read: not owned.
   expect(
     isOwnerless(1, () => {

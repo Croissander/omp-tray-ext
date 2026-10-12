@@ -6,6 +6,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: oven-sh/setup-bun@v2
+      # dbus-daemon: daemon.test.ts self-skips its whole hermetic suite
+      # without it — CI must never pass on those skips.
+      - run: sudo apt-get update && sudo apt-get install -y dbus
       - run: bun install --frozen-lockfile
       - run: bunx tsc --noEmit
       - run: bun test

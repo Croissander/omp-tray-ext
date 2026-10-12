@@ -62,10 +62,41 @@ export function deadline<T>(p: Promise<T>, ms: number, unrefTimer = false): Prom
 
 /** Unref'd sleep: fires while the process lives but never keeps it alive. */
 function parkTimer(ms: number): Promise<void> {
-  return new Promise((resolve) => {
-    const t = setTimeout(resolve, ms);
-    (t as unknown as { unref?: () => void }).unref?.();
-  });
+  const { promise, resolve } = Promise.withResolvers<void>();
+  const timer = setTimeout(resolve, ms);
+  unrefTimer(timer);
+  return promise;
+}
+
+/**
+ * A dbus-next connection's raw socket: no public API exposes it (no hard
+ * close, no unref), it lives at `_connection.stream`. Named once so the two
+ * private-path pokes below share one honest shape.
+ */
+interface SocketInternals {
+  _connection?: { stream?: { unref?: () => void; destroy?: () => void } };
+}
+
+function unrefTimer(handle: unknown): void {
+  if (handle && typeof handle === "object" && "unref" in handle && typeof handle.unref === "function") {
+    handle.unref();
+  }
+}
+
+/**
+ * Disconnect and HARD-close a connection's socket. `bus.disconnect()` is only
+ * `stream.end()` — a graceful FIN whose FD parks in FIN_WAIT/CLOSE_WAIT
+ * against a hung peer until that peer dies. Every call below owns its private
+ * connection and gives up via `deadline()` first, so destroying is safe.
+ */
+function destroyBus(bus: dbus.MessageBus | null): void {
+  try {
+    bus?.disconnect();
+  } catch {}
+  try {
+    const internals = bus as unknown as SocketInternals | null; // private path, see SocketInternals
+    internals?._connection?.stream?.destroy?.();
+  } catch {}
 }
 
 /** Session-bus factory `connectBus` calls; tests swap it to avoid the real bus. */
@@ -99,7 +130,7 @@ function connectBus(timeoutMs = 3000): Promise<BusConnection> {
   bus.on("error", () => { clearTimeout(t); resolve(false); });
   return promise.then((ok) => {
     if (!ok) {
-      try { bus.disconnect(); } catch {}
+      destroyBus(bus);
       return { bus: null, ok: false };
     }
     return { bus, ok: true };
@@ -124,7 +155,7 @@ export async function daemonAlive(timeoutMs = 3000): Promise<boolean> {
   } catch {
     return false;
   } finally {
-    try { conn.bus.disconnect(); } catch {}
+    destroyBus(conn.bus);
   }
 }
 
@@ -149,7 +180,7 @@ export async function daemonProcessPid(timeoutMs = 3000): Promise<number | null>
     // No owner for the name (daemon absent) or the call failed — same answer.
     return null;
   } finally {
-    try { conn.bus.disconnect(); } catch {}
+    destroyBus(conn.bus);
   }
 }
 
@@ -179,7 +210,7 @@ export async function sendState(state: DaemonState, detail?: string, timeoutMs =
     // Daemon not up yet, or vanished — caller recovers (respawn + reseed).
     return false;
   } finally {
-    try { conn.bus.disconnect(); } catch {}
+    destroyBus(conn.bus);
   }
 }
 
@@ -201,7 +232,7 @@ export async function stopDaemon(timeoutMs = 3000): Promise<boolean> {
     // daemon not running — nothing to stop
     return false;
   } finally {
-    try { conn.bus.disconnect(); } catch {}
+    destroyBus(conn.bus);
   }
 }
 
@@ -210,8 +241,10 @@ const ACTION_PROBE_INTERVAL_MS = 30_000;
 
 /**
  * Subscribe to the daemon's menu actions. ONE persistent session-bus
- * connection whose signal match is addressed by the well-known daemon name,
- * so it survives daemon respawns — the bus re-resolves the name per delivery.
+ * connection whose signal match is addressed by the well-known daemon name.
+ * A daemon respawn swaps the unique name behind that name, and dbus-next
+ * filters delivered signals by its cached owner — so the subscription
+ * re-opens on every name re-ownership (see the NameOwnerChanged watch).
  *
  * The connection self-heals like the daemon's own link: reconnect after a
  * bus `error`, and probe liveness every `probeMs` — pending calls never
@@ -234,7 +267,7 @@ export function watchSessionActions(
     while (!stopped) {
       const conn = await connectBus(timeoutMs);
       if (stopped) {
-        try { conn.bus?.disconnect(); } catch {}
+        destroyBus(conn.bus);
         return;
       }
       if (!conn.bus) {
@@ -243,8 +276,12 @@ export function watchSessionActions(
       }
       const bus = conn.bus;
       try {
-        const dead = Promise.withResolvers<void>();
-        bus.on("error", () => dead.resolve());
+        // Settled by the bus `error` event or a name re-ownership. A mutable
+        // callback, not a shared promise raced per probe tick — reactions on
+        // a promise that only settles at connection death would pile up one
+        // per tick for the life of the connection.
+        let die: (() => void) | null = null;
+        bus.on("error", () => die?.());
         const proxy = await deadline(bus.getProxyObject(DAEMON_NAME, DAEMON_PATH), timeoutMs, true);
         const control = proxy.getInterface<DaemonActionSource & dbus.ClientInterface>(DAEMON_IFACE);
         control.on("SessionAction", (action, arg) => {
@@ -254,36 +291,45 @@ export function watchSessionActions(
             console.warn("[omptray] session action handler failed:", (e as Error).message);
           }
         });
+        const driverProxy = await deadline(
+          bus.getProxyObject("org.freedesktop.DBus", "/org/freedesktop/DBus"),
+          timeoutMs,
+          true,
+        );
+        const driver = driverProxy.getInterface<DriverIface & dbus.ClientInterface>("org.freedesktop.DBus");
+        // dbus-next drops any signal whose sender is not the CACHED owner of
+        // the well-known name (proxy-interface.js), and that cache only
+        // re-learns from a delivered NameOwnerChanged or a call reply FROM
+        // the name. A respawned daemon owns the name under a NEW unique id,
+        // so without this watch every later SessionAction is dropped as a
+        // foreign sender — menu clicks dead after one daemon restart. A new
+        // owner tears the connection down: the reconnect's introspection
+        // re-learns the owner and re-subscribes.
+        driver.on("NameOwnerChanged", (name: string, _oldOwner: string, newOwner: string) => {
+          if (name === DAEMON_NAME && newOwner !== "") die?.();
+        });
         // Event-loop neutrality: a short-lived process that merely loads the
         // extension entry (omp install) must be able to exit — the persistent
         // socket and every park/probe timer are unref'd, so the subscription
-        // lives as long as the host lives but never keeps it alive. The
-        // socket lives at bus._connection.stream in dbus-next (no public API;
-        // optional-chained so a lib refactor degrades to "ref'd socket", not
-        // a crash). ponytail: upgrade path an unref handle from dbus-next.
-        try {
-          (bus as unknown as {
-            _connection?: { stream?: { unref?: () => void } };
-          })._connection?.stream?.unref?.();
-        } catch {}
-        // Park until the connection dies: an explicit error event, or a
-        // failed liveness probe (NameHasOwner — `false` is a HEALTHY answer:
-        // an absent daemon is valid, the name-based match revives with it).
+        // lives as long as the host lives but never keeps it alive.
+        // ponytail: upgrade path an unref handle from dbus-next.
+        const internals = bus as unknown as SocketInternals | null; // private path, see SocketInternals
+        internals?._connection?.stream?.unref?.();
+        // Park until the connection dies: an explicit error event, a name
+        // re-ownership, or a failed liveness probe (NameHasOwner — `false` is
+        // a HEALTHY answer: an absent daemon is valid, the name-based match
+        // revives with it).
         while (!stopped) {
-          const woke = await Promise.race([
-            dead.promise.then(() => "dead" as const),
-            parkTimer(probeMs).then(() => "tick" as const),
-          ]);
+          const wake = Promise.withResolvers<"dead" | "tick">();
+          const park = setTimeout(() => wake.resolve("tick"), probeMs);
+          unrefTimer(park);
+          die = () => {
+            clearTimeout(park); // settled race: no dangling probe timer
+            wake.resolve("dead");
+          };
+          const woke = await wake.promise;
           if (stopped || woke === "dead") break;
-          const alive = await deadline(
-            (async () => {
-              const driverProxy = await bus.getProxyObject("org.freedesktop.DBus", "/org/freedesktop/DBus");
-              const driver = driverProxy.getInterface<DriverIface & dbus.ClientInterface>("org.freedesktop.DBus");
-              await driver.NameHasOwner(DAEMON_NAME);
-            })(),
-            timeoutMs,
-            true,
-          ).then(
+          const alive = await deadline(driver.NameHasOwner(DAEMON_NAME), timeoutMs, true).then(
             () => true,
             () => false,
           );
@@ -293,7 +339,7 @@ export function watchSessionActions(
         // Subscribe failed (daemon absent, connect broken) — bounded pause.
         await parkTimer(timeoutMs);
       } finally {
-        try { bus.disconnect(); } catch {}
+        destroyBus(bus);
       }
     }
   })();

@@ -29,7 +29,8 @@ test("glyphs and all 8 spinner frames are visible", () => {
   ];
   for (const px of all) {
     const { bytes } = toArgb(px);
-    const hasOpaque = [...bytes].some((b, i) => i % 4 === 3 && b !== 0);
+    // ARGB32 visibility lives in the alpha byte (index 0 of each pixel).
+    const hasOpaque = [...bytes].some((b, i) => i % 4 === 0 && b !== 0);
     expect(hasOpaque).toBe(true);
   }
 });
@@ -50,6 +51,9 @@ test("spinnerFrameByIndex wraps every 8 frames to the same buffer", () => {
   for (let i = 0; i < 8; i++) {
     expect(spinnerFrameByIndex(i)).toBe(spinnerFrameByIndex(i + 8));
   }
+  // Cyclic in both directions: -1 % 8 is -1 in JS (not 7).
+  expect(spinnerFrameByIndex(-1)).toBe(spinnerFrameByIndex(7));
+  expect(spinnerFrameByIndex(-8)).toBe(spinnerFrameByIndex(0));
 });
 
 test("glyph returns shared pre-rendered instances", () => {

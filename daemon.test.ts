@@ -251,13 +251,39 @@ test.skipIf(!Bun.which("dbus-daemon"))(
     const { addr, busd, watcher, watcherConn, children } = await startRegisteredDaemon();
     const watcher2 = new FakeWatcher();
     let watcher2Conn: dbus.MessageBus | null = null;
+    const client = dbus.sessionBus({ busAddress: addr });
     try {
       expect(watcher.registrations.length).toBe(1);
+
+      // Debug row tracking, event-driven (no polling): the daemon pushes the
+      // watcher row over ItemsPropertiesUpdated whenever it flips. The layout
+      // call first seeds this client's name-owner cache so the signal sender
+      // filter passes (same trick as the SNI conformance pin).
+      const menuObj = await client.getProxyObject(DAEMON_NAME, "/MenuBar");
+      const menu = menuObj.getInterface<DaemonMenuIface & dbus.ClientInterface>(DBUSMENU_IFACE);
+      await menu.GetLayout(0, 0, []);
+      const sawDown = Promise.withResolvers<void>();
+      const sawUp = Promise.withResolvers<void>();
+      menuObj
+        .getInterface<{
+          on(event: "ItemsPropertiesUpdated", handler: (updated: [number, Record<string, dbus.Variant>][]) => void): unknown;
+        } & dbus.ClientInterface>(DBUSMENU_IFACE)
+        .on("ItemsPropertiesUpdated", (updated) => {
+          for (const [id, props] of updated) {
+            if (id !== 13) continue;
+            const label = String(props.label?.value ?? "");
+            if (label === "watcher: not registered") sawDown.resolve();
+            if (label === "watcher: registered") sawUp.resolve();
+          }
+        });
 
       // Panel restart: the watcher's in-memory item list dies with its
       // connection; a fresh instance (new connection) re-claims the name with
       // an empty list, and no host ever solicits re-registration.
       watcherConn.disconnect();
+      // The Debug row must stop claiming "registered" the moment the watcher
+      // dies — our item died with its in-memory list.
+      await sawDown.promise;
       watcher2Conn = dbus.sessionBus({ busAddress: addr });
       watcher2Conn.export("/StatusNotifierWatcher", watcher2);
       await watcher2Conn.requestName(WATCHER_NAME, 0);
@@ -269,8 +295,11 @@ test.skipIf(!Bun.which("dbus-daemon"))(
       // Exactly one registration per owner appearance — churn must not
       // multiply them.
       expect(watcher.registrations.length + watcher2.registrations.length).toBe(2);
+      // ...and the row returns to "registered" only once the fresh watcher
+      // accepted us.
+      await sawUp.promise;
     } finally {
-      await cleanup(children, [watcherConn, watcher2Conn], busd);
+      await cleanup(children, [watcherConn, watcher2Conn, client], busd);
     }
   },
   15_000,
@@ -295,6 +324,8 @@ test.skipIf(!Bun.which("dbus-daemon"))(
       expect(["", "/NO_DBUSMENU"]).not.toContain(String(all.Menu?.value ?? ""));
       // The menu is real now (v1.4.0 dbusmenu): hosts are told it exists.
       expect(all.ItemIsMenu?.value).toBe(true);
+      // Spec 3.1.5: UINT32 WindowId, 0 when the app has no window to expose.
+      expect(all.WindowId?.value).toBe(0);
 
       const sni = item.getInterface("org.kde.StatusNotifierItem");
       const statuses: unknown[] = [];
@@ -463,6 +494,59 @@ test.skipIf(!Bun.which("dbus-daemon"))(
         Bun.sleep(4000).then(() => false),
       ]);
       expect(exited).toBe(true);
+    } finally {
+      await cleanup(children, [watcherConn, client], busd);
+    }
+  },
+  15_000,
+);
+
+// ---- Canonical dbusmenu signature pins ------------------------------------
+
+test.skipIf(!Bun.which("dbus-daemon"))(
+  "conformant dbusmenu calls land: GetGroupProperties aias, EventGroup a(isvu), AboutToShowGroup aiai",
+  async () => {
+    const { addr, busd, watcher, watcherConn, children } = await startRegisteredDaemon();
+    const client = dbus.sessionBus({ busAddress: addr });
+    try {
+      const service = watcher.registrations[0] ?? "";
+      // Raw messages carrying the CANONICAL wire signatures (the waybar/
+      // libdbusmenu interface XML). dbus-next dispatches on an exact
+      // in-signature match, so a wrongly declared signature rejects these
+      // outright — this is exactly what a conformant panel sends.
+      const call = async (member: string, signature: string, body: unknown[]): Promise<dbus.Message> => {
+        const reply = await client.call(
+          new dbus.Message({
+            destination: service,
+            path: "/MenuBar",
+            interface: DBUSMENU_IFACE,
+            member,
+            signature,
+            body,
+          }),
+        );
+        if (!reply) throw new Error(`no reply for ${member}`);
+        return reply;
+      };
+
+      const group = await call("GetGroupProperties", "aias", [[1, 3], []]);
+      const rows = group.body[0];
+      expect(Array.isArray(rows) && rows.map((row) => row[0])).toEqual([1, 3]);
+
+      // EventGroup returns idErrors — the ids it could NOT act on: a real
+      // prompt click dispatches (no error), junk does not.
+      const dispatched = await call("EventGroup", "a(isvu)", [
+        [[5, "clicked", new dbus.Variant("s", ""), 1]],
+      ]);
+      expect(dispatched.body[0]).toEqual([]);
+      const junk = await call("EventGroup", "a(isvu)", [[[999, "clicked", new dbus.Variant("s", ""), 1]]]);
+      expect(junk.body[0]).toEqual([999]);
+
+      // AboutToShowGroup answers (updatesNeeded, idErrors) as two arrays.
+      const about = await call("AboutToShowGroup", "ai", [[0]]);
+      expect(about.body).toEqual([[], []]);
+      const badAbout = await call("AboutToShowGroup", "ai", [[42]]);
+      expect(badAbout.body).toEqual([[], [42]]);
     } finally {
       await cleanup(children, [watcherConn, client], busd);
     }
